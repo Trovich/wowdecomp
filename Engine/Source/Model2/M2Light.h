@@ -83,4 +83,24 @@ class CM2Lighting {
     void SetupSunlight();
 };
 
+// TROVICH: sort key shared by CM2Lighting::AddLight and CM2LightList (smaller = more important)
+float M2LightSortKey(const CM2Light* light, const CAaSphere& sphere);
+
+// TROVICH: distance at which a point light still adds 1/100 (client attenuation 1 / (c + l d + q d^2))
+float M2LightReach(const CM2Light* light);
+
+// TROVICH: point lights only, more than CM2Lighting's 4 - for terrain chunks drawing extra light passes
+class CM2LightList {
+    public:
+    static const uint32_t CAPACITY = 128;
+
+    CAaSphere m_sphere;
+    CM2Light* m_lights[CAPACITY];
+    float m_keys[CAPACITY];
+    uint32_t m_count = 0;
+
+    void Reset(const CAaSphere& sphere);
+    void Add(CM2Light* light);
+};
+
 #endif

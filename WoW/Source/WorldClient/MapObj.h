@@ -11,6 +11,10 @@
 #include "Engine/Source/Storm/H/stpl.h"
 #include "Engine/Source/Tempest/CWFrustum.h"
 #include "WoW/Source/WorldClient/MapObjGroup.h"
+#include "Engine/Source/Model2/M2Light.h"
+
+class CGxShader;
+class CGxBatch;
 
 struct MINIMAPQUADINFO;
 class C2Vector;
@@ -70,6 +74,16 @@ class CMapObj : public CMapObjIndex, public TSHashObject<CMapObj, HASHKEY_NONE> 
     static CShaderEffect* s_classicShaders[7];
     static CShaderEffect* s_unifiedShaders[7];
     static int32_t s_lightingMode;
+    static CM2LightList s_groupLights;                                                         // TROVICH
+    static uint32_t s_groupStockLightCount;                                                    // TROVICH
+    static CGxShader* s_lightOnlyVertexShader;                                                // TROVICH
+    static CGxShader* s_pixelLightVertexShader;                                               // TROVICH
+    static CGxShader* s_pixelLightPixelShader[2];                                             // TROVICH
+    static int32_t s_extraLightShadersTried;                                                  // TROVICH
+    static int32_t UsePixelLights(uint32_t shader, uint32_t blendMode);                       // TROVICH
+    static void BeginBatchLights(uint32_t shader, uint32_t blendMode);                        // TROVICH
+    static void RenderExtraLightPasses(CGxBatch draw, const SMOBatch& batch, uint32_t shader, uint32_t blendMode);  // TROVICH
+    static C44Matrix s_mapObjWorld;                                                           // TROVICH
     static uint32_t s_maxLiquidQueryDepth;
 
     static void ClearCache(int32_t unused_a1);

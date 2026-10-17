@@ -14,6 +14,7 @@
 #include "WoW/Source/WorldClient/MapBaseObj.h"
 
 class CM2Lighting;
+class CM2LightList;
 
 class CMapObj;
 class CMapLight;
@@ -46,6 +47,7 @@ class CMapObjDefGroup : public CMapBaseObj {
     /* 00B8 */ TSLink<CMapObjDefGroup> m_liquidLink;
 
     virtual void SelectLights(CM2Lighting* lighting);
+    void SelectPointLights(CM2LightList* list);  // TROVICH
 
     CMapObjDefGroup();
     ~CMapObjDefGroup() override;

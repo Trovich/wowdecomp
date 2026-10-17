@@ -354,6 +354,14 @@ void Snow::RenderPackets() {
     C4Vector color(World::s_weather->m_color);
     g_theGxDevicePtr->ShaderConstantsSet(GxSh_Vertex, 8, reinterpret_cast<const float*>(&color), 1);
     GxRsSet(GxRs_VertexShader, this->m_shaderPtr);
+
+    // TROVICH: TrovichSnowLit = snowpoint + colour * min(sky light + lamps, 1) (client-patches/decomp-shaders)
+    if (CGxShader* lit = WeatherLights::Shader(WeatherLights::SHADER_SNOW)) {
+        static WeatherLights s_lights;
+        s_lights.Gather(*World::GetCamPos(), 60.0f);
+        s_lights.SetVertexConstants(WeatherLights::SkyLight(), 0.0f);
+        g_theGxDevicePtr->RsSet(GxRs_VertexShader, lit);
+    }
     C44Matrix view;
     GxXformView(view);
     C44Matrix projection;
@@ -442,6 +450,13 @@ void Snow::RenderPacketsSW() {
     CImVector color = World::s_weather->m_color;
     GxFormatColor(color);
 
+    // TROVICH: flakes take the light around them: the sky light of the time of day (so night snow is no
+    // longer bright white) plus every lamp near the flake; stock = the flat weather colour
+    CImVector baseColor = World::s_weather->m_color;
+    C3Vector sky = WeatherLights::SkyLight();
+    static WeatherLights s_lights;
+    s_lights.Gather(camera, 60.0f);
+
     for (Packet<SnowFlakeParticleBuffer>* packet = this->m_snowFlakePacketList.m_activePackets.Head(); packet; packet = this->m_snowFlakePacketList.m_activePackets.Next(packet)) {
         if (packet->m_packetStartTick >= now) {
             continue;
@@ -475,6 +490,20 @@ void Snow::RenderPacketsSW() {
 
             if (fadeAlpha < 1.0f) {
                 alpha = fadeAlpha;
+            }
+
+            // TROVICH: lit flake colour (alpha below stays stock)
+            {
+                C3Vector light = s_lights.At(position);
+                float r = sky.x + light.x;
+                float g = sky.y + light.y;
+                float b = sky.z + light.z;
+                CImVector lit = baseColor;
+                lit.r = static_cast<uint8_t>(baseColor.r * (r < 1.0f ? r : 1.0f));
+                lit.g = static_cast<uint8_t>(baseColor.g * (g < 1.0f ? g : 1.0f));
+                lit.b = static_cast<uint8_t>(baseColor.b * (b < 1.0f ? b : 1.0f));
+                GxFormatColor(lit);
+                color = lit;
             }
 
             color.a = static_cast<uint8_t>(static_cast<int32_t>(alpha * 255.0f));

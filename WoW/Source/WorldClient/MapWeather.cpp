@@ -11,6 +11,11 @@
 #include "WoW/Source/Object/ObjectClient/Unit_C.h"
 #include "WoW/Source/ObjectMgrClient/ObjectMgrClient.h"
 #include "WoW/Source/WorldClient/World.h"
+#include "Engine/Source/Model2/M2Light.h"
+#include "Engine/Source/Model2/M2Scene.h"
+#include "Engine/Source/Gx/CGxDevice/CGxDevice.h"
+#include "Engine/Source/Gx/CGxDevice/CGxShader.h"
+#include "Engine/Source/Tempest/C4Vector.h"
 #include "Engine/Source/Os/TimeManager.h"
 #include "WoW/Source/DB/Rec/WeatherRec.h"
 #include "WoW/Source/WorldClient/Map.h"
@@ -23,6 +28,120 @@ float s_weatherDensity = 0.66f;
 
 // STATIC: 0x00CD8528
 uint8_t s_weatherTypeForced;
+
+// TROVICH: lamps for rain / snow (see WeatherLights in MapWeather.h)
+void WeatherLights::Gather(const C3Vector& centre, float radius) {
+    this->m_count = 0;
+
+    if (!World::s_m2Scene) {
+        return;
+    }
+
+    static CM2LightList s_list;
+    CAaSphere sphere;
+    sphere.c = centre;
+    sphere.r = radius;
+    s_list.Reset(sphere);
+    World::s_m2Scene->SelectPointLights(&s_list);
+
+    for (uint32_t i = 0; i < s_list.m_count && this->m_count < MAX; i++) {
+        CM2Light* light = s_list.m_lights[i];
+        float reach = M2LightReach(light);
+        C3Vector d = light->m_pos - centre;
+        float limit = reach + radius;
+
+        if (reach <= 0.0f || d.x * d.x + d.y * d.y + d.z * d.z > limit * limit) {
+            continue;
+        }
+
+        uint32_t n = this->m_count++;
+        this->m_pos[n] = light->m_pos;
+        this->m_color[n] = light->m_dirColor;
+        this->m_constant[n] = light->m_constantAttenuation;
+        this->m_linear[n] = light->m_linearAttenuation;
+        this->m_quadratic[n] = light->m_quadraticAttenuation;
+        this->m_reach2[n] = reach * reach;
+    }
+}
+
+C3Vector WeatherLights::At(const C3Vector& point) const {
+    C3Vector sum(0.0f, 0.0f, 0.0f);
+
+    for (uint32_t i = 0; i < this->m_count; i++) {
+        C3Vector d = this->m_pos[i] - point;
+        float d2 = d.x * d.x + d.y * d.y + d.z * d.z;
+
+        if (d2 > this->m_reach2[i]) {
+            continue;
+        }
+
+        float dist = sqrtf(d2);
+        float denominator = this->m_constant[i] + this->m_linear[i] * dist + this->m_quadratic[i] * d2;
+        float att = 1.0f / (denominator > 1e-4f ? denominator : 1e-4f);
+        sum.x += this->m_color[i].x * att;
+        sum.y += this->m_color[i].y * att;
+        sum.z += this->m_color[i].z * att;
+    }
+
+    return sum;
+}
+
+void WeatherLights::SetVertexConstants(const C3Vector& sky, float strength) const {
+    const uint32_t lamps = 8;
+    C4Vector constants[3 * lamps + 1];
+
+    for (uint32_t i = 0; i < lamps; i++) {
+        C4Vector& position = constants[i];
+        C4Vector& color = constants[lamps + i];
+        C4Vector& attenuation = constants[2 * lamps + i];
+        bool used = i < this->m_count;
+        position.x = used ? this->m_pos[i].x : 0.0f;
+        position.y = used ? this->m_pos[i].y : 0.0f;
+        position.z = used ? this->m_pos[i].z : 0.0f;
+        position.w = 1.0f;
+        color.x = used ? this->m_color[i].x : 0.0f;
+        color.y = used ? this->m_color[i].y : 0.0f;
+        color.z = used ? this->m_color[i].z : 0.0f;
+        color.w = 0.0f;
+        attenuation.x = used ? this->m_constant[i] : 1.0f;
+        attenuation.y = used ? this->m_linear[i] : 0.0f;
+        attenuation.z = used ? this->m_quadratic[i] : 0.0f;
+        attenuation.w = 0.0f;
+    }
+
+    C4Vector& params = constants[3 * lamps];
+    params.x = sky.x;
+    params.y = sky.y;
+    params.z = sky.z;
+    params.w = strength;
+
+    g_theGxDevicePtr->ShaderConstantsSet(GxSh_Vertex, 24, &constants[0].x, 3 * lamps + 1);
+}
+
+CGxShader* WeatherLights::Shader(uint32_t which) {
+    static CGxShader* s_shaders[SHADER_COUNT];
+    static int32_t s_tried;
+
+    if (!s_tried) {
+        s_tried = 1;
+        g_theGxDevicePtr->ShaderCreate(&s_shaders[SHADER_SNOW], GxSh_Vertex, "Shaders\\Vertex", "TrovichSnowLit", 1);
+        g_theGxDevicePtr->ShaderCreate(&s_shaders[SHADER_RAIN], GxSh_Vertex, "Shaders\\Vertex", "TrovichRainGlint", 1);
+        g_theGxDevicePtr->ShaderCreate(&s_shaders[SHADER_PATTER], GxSh_Vertex, "Shaders\\Vertex", "TrovichPatterGlint", 1);
+    }
+
+    CGxShader* shader = which < SHADER_COUNT ? s_shaders[which] : nullptr;
+
+    return shader && shader->Valid() ? shader : nullptr;
+}
+
+C3Vector WeatherLights::SkyLight() {
+    DayNight::DNInfo* info = DayNight::GetInfo();
+    const float k = 1.0f / 255.0f;
+
+    return C3Vector((info->m_light1.m_ambient.r + info->m_light1.m_diffuse.r) * k,
+                    (info->m_light1.m_ambient.g + info->m_light1.m_diffuse.g) * k,
+                    (info->m_light1.m_ambient.b + info->m_light1.m_diffuse.b) * k);
+}
 
 // VERIFY: 63454e2e manual
 // OFFSET: 0x00783B30

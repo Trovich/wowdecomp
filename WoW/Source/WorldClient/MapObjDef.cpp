@@ -39,6 +39,21 @@ CMapObjDefGroup::CMapObjDefGroup() {
     this->m_liquidInstance = nullptr;
 }
 
+// TROVICH: the point lights SelectLights would add (the WMO's own placed lights), into a longer list
+void CMapObjDefGroup::SelectPointLights(CM2LightList* list) {
+    if (!(CWorld::farFog > this->m_distanceToCamera)) {
+        return;
+    }
+
+    for (CMapBaseObjLink* link = this->m_lightLinkList.Head(); link; link = this->m_lightLinkList.Next(link)) {
+        CMapLight* light = static_cast<CMapLight*>(link->m_owner);
+
+        if (light->m_light.m_visible && !light->unk_00D1) {
+            list->Add(&light->m_light);
+        }
+    }
+}
+
 // VERIFY: 7ed1c1b6 manual
 // OFFSET: 0x007B3F30
 void CMapObjDefGroup::SelectLights(CM2Lighting* lighting) {

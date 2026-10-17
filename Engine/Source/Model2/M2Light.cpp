@@ -211,6 +211,94 @@ void CM2Lighting::AddDiffuse(const C3Vector& color, const C3Vector& dir) {
     this->m_sunDiffuse = color;
 }
 
+// TROVICH: stock CM2Lighting::AddLight keeps the 4 point lights nearest to the CENTRE of the lit object's
+// sphere (squared centre distance), which picks the wrong lamps for long models and big WMO groups.
+// This key (smaller = kept first) is the light's expected weakness at the object instead: attenuation at
+// the edge of the sphere divided by the light's brightness. Lights inside the sphere would all tie at the
+// edge distance 0 and be kept in arrival order - neighbouring terrain chunks then pick different sets
+// (seams) - so a quarter of the centre distance breaks those ties the stock way.
+float M2LightSortKey(const CM2Light* light, const CAaSphere& sphere) {
+    float dx = light->m_pos.x - sphere.c.x;
+    float dy = light->m_pos.y - sphere.c.y;
+    float dz = light->m_pos.z - sphere.c.z;
+    float centre = sqrtf(dx * dx + dy * dy + dz * dz);
+    float edge = centre - sphere.r;
+
+    if (edge < 0.0f) {
+        edge = 0.0f;
+    }
+
+    edge += 0.25f * centre;
+    float attenuation = 1.0f + edge * (light->m_linearAttenuation + edge * light->m_quadraticAttenuation);
+    float brightness = light->m_dirColor.x + light->m_dirColor.y + light->m_dirColor.z + 1e-4f;
+
+    return attenuation / brightness;
+}
+
+// TROVICH: how far a point light still adds a visible amount (1/100) with the client's fixed attenuation
+// 1 / (c + l*d + q*d^2) - lamps of intensity 2 reach ~70 yd, 4 ~105 yd
+float M2LightReach(const CM2Light* light) {
+    float bright = light->m_dirColor.x;
+
+    if (light->m_dirColor.y > bright) {
+        bright = light->m_dirColor.y;
+    }
+
+    if (light->m_dirColor.z > bright) {
+        bright = light->m_dirColor.z;
+    }
+
+    float target = bright * 100.0f - light->m_constantAttenuation;
+    float l = light->m_linearAttenuation;
+    float q = light->m_quadraticAttenuation;
+
+    if (target <= 0.0f) {
+        return 0.0f;
+    }
+
+    if (q > 0.0f) {
+        return (-l + sqrtf(l * l + 4.0f * q * target)) / (2.0f * q);
+    }
+
+    return l > 0.0f ? target / l : 1.0e6f;
+}
+
+// TROVICH: a longer, point-lights-only list for terrain chunks, which draw extra additive passes for the
+// lights beyond the 3 their vertex shader takes (CMapRenderChunk::RenderExtraLightPasses)
+void CM2LightList::Reset(const CAaSphere& sphere) {
+    this->m_sphere = sphere;
+    this->m_count = 0;
+}
+
+void CM2LightList::Add(CM2Light* light) {
+    if (!light->m_visible || light->m_type != M2LIGHT_POINT) {
+        return;
+    }
+
+    float key = M2LightSortKey(light, this->m_sphere);
+    uint32_t count = this->m_count;
+
+    if (count >= CAPACITY) {
+        if (key >= this->m_keys[CAPACITY - 1]) {
+            return;
+        }
+
+        count--;
+    }
+
+    for (; count && key <= this->m_keys[count - 1]; count--) {
+        this->m_lights[count] = this->m_lights[count - 1];
+        this->m_keys[count] = this->m_keys[count - 1];
+    }
+
+    this->m_keys[count] = key;
+    this->m_lights[count] = light;
+
+    if (this->m_count < CAPACITY) {
+        this->m_count++;
+    }
+}
+
 // VERIFY: 7d1db3b8 manual
 // OFFSET: 0x00834F60
 void CM2Lighting::AddLight(CM2Light* light) {
@@ -225,10 +313,8 @@ void CM2Lighting::AddLight(CM2Light* light) {
         return;
     }
 
-    float dz = light->m_pos.z - this->m_sphere4.c.z;
-    float dy = light->m_pos.y - this->m_sphere4.c.y;
-    float dx = light->m_pos.x - this->m_sphere4.c.x;
-    float dist = dx * dx + (dy * dy + dz * dz);
+    // TROVICH: stock key = squared distance to the sphere centre; see M2LightSortKey
+    float dist = M2LightSortKey(light, this->m_sphere4);
 
     uint32_t count = this->m_lightCount;
     const uint32_t capacity = sizeof(this->m_lights) / sizeof(this->m_lights[0]);

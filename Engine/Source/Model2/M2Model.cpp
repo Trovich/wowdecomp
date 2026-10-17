@@ -6229,6 +6229,21 @@ void CM2Model::SetupLighting() {
         sphere.r = 0.0f;
         sphere.c = center;
 
+        // TROVICH: stock lights a model from a zero-radius sphere at its ORIGIN, and CM2Scene::SelectLights
+        // only scans the light-grid cells (20 yd) around that point - a lamp over one end of a long model
+        // (the 64 yd Duskwood bridge, origin mid-bridge) is never even a candidate. Use the model's real
+        // bounding sphere instead: bounds centre in world space, bounds radius times the model scale.
+        if (this->m_shared->m_flags & 1) {
+            const M2Bounds& bounds = this->m_shared->m_data->m_bounds;
+
+            if (bounds.m_radius > 0.0f) {
+                C44Matrix world = this->m_matrixF4 * this->m_scene->m_viewInv;
+                C3Vector local((bounds.m_extent.b.x + bounds.m_extent.t.x) * 0.5f, (bounds.m_extent.b.y + bounds.m_extent.t.y) * 0.5f, (bounds.m_extent.b.z + bounds.m_extent.t.z) * 0.5f);
+                sphere.c = local * world;
+                sphere.r = sqrtf(world.a0 * world.a0 + world.a1 * world.a1 + world.a2 * world.a2) * bounds.m_radius;
+            }
+        }
+
         this->m_lighting.Initialize(this->m_scene, sphere);
         this->m_scene->SelectLights(&this->m_lighting);
 

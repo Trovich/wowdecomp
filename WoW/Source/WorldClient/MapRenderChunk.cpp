@@ -2041,6 +2041,106 @@ void CMapRenderChunk::InitializeVertexShaderConstants(const C44Matrix& world, co
     }
 }
 
+// TROVICH: the chunk's point lights, sorted by M2LightSortKey; filled in SetVertexShader
+CM2LightList CMapRenderChunk::s_chunkLights;
+
+// TROVICH: loads lights [first, first + 3) of s_chunkLights into the vertex shader constants (not uploaded);
+// returns whether any of them is a light
+int32_t CMapRenderChunk::SetPointLightConstants(uint32_t first) {
+    SVertexShaderConstants& consts = CMapRenderChunk::s_vertexShaderConsts;
+    int32_t any = 0;
+
+    for (uint32_t i = 0; i < 3; i++) {
+        SVertexShaderConstants::SPointLight& light = consts.m_pointLights[i];
+
+        if (first + i < CMapRenderChunk::s_chunkLights.m_count) {
+            CM2Light* point = CMapRenderChunk::s_chunkLights.m_lights[first + i];
+            light.m_position = point->m_pos - CWorldScene::s_activeWorldView;
+            light.m_positionW = 1.0f;
+            light.m_color = point->m_dirColor;
+            light.m_attenuation = C3Vector(point->m_constantAttenuation, point->m_linearAttenuation, point->m_quadraticAttenuation);
+            any = 1;
+        } else {
+            light.m_position = C3Vector(0.0f, 0.0f, 0.0f);
+            light.m_positionW = 0.0f;
+            light.m_color = C3Vector(0.0f, 0.0f, 0.0f);
+            light.m_colorW = 0.0f;
+            light.m_attenuation = C3Vector(1.0f, 0.0f, 0.0f);
+            light.m_attenuationW = 0.0f;
+        }
+    }
+
+    return any;
+}
+
+// TROVICH: the terrain vertex shader takes 3 point lights per chunk; where more lamps reach a chunk, the
+// neighbouring chunks keep different sets and their light ends at the chunk border (seams). Lighting is
+// linear (texture * (sun + L1..L3) + texture * (L4..L6) = texture * (sun + L1..L6)), so the chunk is drawn
+// again with the next 3 lights, the sun off, black fog and additive blending - as the stock fixed-function
+// path already does for its extra layer passes (RenderMultiPassAdditive). Call right after the chunk's
+// normal Draw, with its textures and shaders still set.
+void CMapRenderChunk::RenderExtraLightPasses(CMapRenderChunk* renderChunk) {
+    uint32_t total = CMapRenderChunk::s_chunkLights.m_count;
+
+    if (total <= 3) {
+        return;
+    }
+
+    // layers drawn unlit (flag 0x80, lava etc.) would be added again in full
+    for (uint32_t i = 0; i < renderChunk->m_layersCount; i++) {
+        if (renderChunk->m_layers[i].m_flags & 0x80) {
+            return;
+        }
+    }
+
+    SVertexShaderConstants& consts = CMapRenderChunk::s_vertexShaderConsts;
+    C3Vector sunAmbient = consts.m_sunAmbient;
+    C3Vector sunDiffuse = consts.m_sunDiffuse;
+    C3Vector sunSpecular = consts.m_sunSpecular;
+    consts.m_sunAmbient = C3Vector(0.0f, 0.0f, 0.0f);
+    consts.m_sunDiffuse = C3Vector(0.0f, 0.0f, 0.0f);
+    consts.m_sunSpecular = C3Vector(0.0f, 0.0f, 0.0f);
+
+    g_theGxDevicePtr->RsPush();
+    GxRsSet(GxRs_BlendingMode, GxBlend_NoAlphaAdd);
+    GxUpdateAlphaRef(GxRs_AlphaRef);
+    GxRsSet(GxRs_DepthWrite, 0);
+
+    // the fog colour lives in the render state or in pixel constant c2, depending on the device (as in
+    // RenderMultiPassVertexPixelShader)
+    int32_t fogInRenderState = g_theGxDevicePtr->Caps().unk_0134;
+
+    if (fogInRenderState) {
+        GxRsSet(GxRs_FogColor, 0);
+    } else {
+        C4Vector black;
+        black.x = 0.0f;
+        black.y = 0.0f;
+        black.z = 0.0f;
+        black.w = 0.0f;
+        GxShaderConstantsSet(GxSh_Pixel, 2, &black.x, 1);
+    }
+
+    for (uint32_t first = 3; first < total; first += 3) {
+        CMapRenderChunk::SetPointLightConstants(first);
+        g_theGxDevicePtr->ShaderConstantsSet(GxSh_Vertex, 0, reinterpret_cast<const float*>(&consts), sizeof(SVertexShaderConstants) / sizeof(C4Vector));
+        g_theGxDevicePtr->Draw(&renderChunk->m_batch, 1);
+    }
+
+    g_theGxDevicePtr->RsPop();
+
+    if (!fogInRenderState) {
+        C4Vector fogColor(CMapRenderChunk::s_fogColor);
+        GxShaderConstantsSet(GxSh_Pixel, 2, &fogColor.x, 1);
+    }
+
+    consts.m_sunAmbient = sunAmbient;
+    consts.m_sunDiffuse = sunDiffuse;
+    consts.m_sunSpecular = sunSpecular;
+    CMapRenderChunk::SetPointLightConstants(0);
+    g_theGxDevicePtr->ShaderConstantsSet(GxSh_Vertex, 0, reinterpret_cast<const float*>(&consts), sizeof(SVertexShaderConstants) / sizeof(C4Vector));
+}
+
 // VERIFY: aed99aca manual
 // OFFSET: 0x007D0050
 void CMapRenderChunk::SetVertexShader(CMapRenderChunk* renderChunk, int32_t layerCount, int32_t a3) {
@@ -2052,25 +2152,32 @@ void CMapRenderChunk::SetVertexShader(CMapRenderChunk* renderChunk, int32_t laye
     World::s_m2Scene->SelectLights(&lighting);
     renderChunk->SelectLights(&lighting);
 
-    C3Vector position(0.0f, 0.0f, 0.0f);
-    int32_t pointLights = 0;
+    // TROVICH: the point lights come from a longer list (up to CM2LightList::CAPACITY) so that
+    // RenderExtraLightPasses can draw the ones beyond the shader's 3 - same order as CM2Lighting's 4
+    CMapRenderChunk::s_chunkLights.Reset(renderChunk->m_sphere);
+    World::s_m2Scene->SelectPointLights(&CMapRenderChunk::s_chunkLights);
 
-    for (uint32_t i = 0; i < 3; i++) {
-        SVertexShaderConstants::SPointLight& light = consts.m_pointLights[i];
+    // drop the lights that cannot reach the chunk (the list keeps its order); the grid walk hands over
+    // everything in the 20 yd cells around the chunk and further lamps of the scene's global list
+    {
+        CM2LightList& list = CMapRenderChunk::s_chunkLights;
+        uint32_t kept = 0;
 
-        if (lighting.GetPointLight(i, position, light.m_color, light.m_attenuation)) {
-            light.m_position = position - CWorldScene::s_activeWorldView;
-            light.m_positionW = 1.0f;
-            pointLights = 1;
-        } else {
-            light.m_position = C3Vector(0.0f, 0.0f, 0.0f);
-            light.m_positionW = 0.0f;
-            light.m_color = C3Vector(0.0f, 0.0f, 0.0f);
-            light.m_colorW = 0.0f;
-            light.m_attenuation = C3Vector(1.0f, 0.0f, 0.0f);
-            light.m_attenuationW = 0.0f;
+        for (uint32_t i = 0; i < list.m_count; i++) {
+            CM2Light* light = list.m_lights[i];
+            C3Vector d = light->m_pos - list.m_sphere.c;
+            float reach = M2LightReach(light) + list.m_sphere.r;
+
+            if (d.x * d.x + d.y * d.y + d.z * d.z <= reach * reach) {
+                list.m_keys[kept] = list.m_keys[i];
+                list.m_lights[kept++] = light;
+            }
         }
+
+        list.m_count = kept;
     }
+
+    int32_t pointLights = CMapRenderChunk::SetPointLightConstants(0);
 
     consts.m_position.x = renderChunk->m_vec1.x;
     consts.m_position.y = renderChunk->m_vec1.y;
@@ -2725,6 +2832,7 @@ void CMapRenderChunk::RenderSinglePassVertexPixelShader() {
 
     CMapRenderChunk::SetVertexShader(this, this->m_layersCount + 1, specular);
     g_theGxDevicePtr->Draw(&this->m_batch, 1);
+    CMapRenderChunk::RenderExtraLightPasses(this);  // TROVICH
 
     for (uint32_t j = 0; j < this->m_layersCount; j++) {
         if (this->m_layers[j].m_flags & 0x40) {

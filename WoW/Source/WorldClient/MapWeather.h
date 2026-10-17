@@ -112,6 +112,30 @@ struct PosDelta : public TSLinkedNode<PosDelta> {
 
 class Sand;
 
+// TROVICH: the point lights (lamps) near the camera that light rain and snow; gathered once per render with
+// the same candidates as surfaces (CM2Scene::SelectPointLights) and the client's fixed attenuation
+struct WeatherLights {
+    static const uint32_t MAX = 16;
+
+    uint32_t m_count = 0;
+    C3Vector m_pos[MAX];
+    C3Vector m_color[MAX];
+    float m_constant[MAX];
+    float m_linear[MAX];
+    float m_quadratic[MAX];
+    float m_reach2[MAX];
+
+    void Gather(const C3Vector& centre, float radius);
+    C3Vector At(const C3Vector& point) const;   // summed light colour at a world point, no facing
+    static C3Vector SkyLight();                 // outdoor ambient + sun diffuse of the current time of day
+
+    // shader path: vertex constants c24..c48 of client-patches/decomp-shaders/TrovichWeather.hlsl
+    // (first 8 lights; params = sky light rgb for snow, glint strength in w for rain / splashes)
+    void SetVertexConstants(const C3Vector& sky, float strength) const;
+    enum { SHADER_SNOW, SHADER_RAIN, SHADER_PATTER, SHADER_COUNT };
+    static CGxShader* Shader(uint32_t which);   // nullptr when missing / invalid
+};
+
 class Weather {
     public:
     static int32_t TimeToFixed(float seconds);

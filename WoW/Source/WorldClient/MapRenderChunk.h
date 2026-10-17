@@ -11,6 +11,7 @@
 #include "Engine/Source/Tempest/C44Matrix.h"
 #include "Engine/Source/Tempest/C4Vector.h"
 #include "Engine/Source/Tempest/CImVector.h"
+#include "Engine/Source/Model2/M2Light.h"
 
 class CMapArea;
 class CM2Lighting;
@@ -108,6 +109,9 @@ class CMapRenderChunk {
     static void RenderMultiPassVertexPixelShaderBigAlpha(CMapRenderChunk* renderChunk);
     static void RenderMultiPassVertexPixelShader(CMapRenderChunk* renderChunk);
     static void SetVertexShader(CMapRenderChunk* renderChunk, int32_t layerCount, int32_t a3);
+    static CM2LightList s_chunkLights;                                      // TROVICH
+    static int32_t SetPointLightConstants(uint32_t first);                  // TROVICH
+    static void RenderExtraLightPasses(CMapRenderChunk* renderChunk);       // TROVICH
     static uint8_t* DecodeAlphaRLE(uint8_t* src, uint8_t* dst, int32_t count);
     static void SetupAlphaRows(uint8_t** shadowCursor, uint8_t** shadowRow, SLayerAlpha* layers, uint32_t size, uint8_t** alphaRows);
     static void SetupAlphaRows4444(uint32_t size, uint8_t** shadowRow, uint8_t** alphaRows, SLayerAlpha* layers, uint8_t** shadowCursor);

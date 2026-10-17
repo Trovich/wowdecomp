@@ -34,6 +34,25 @@ uint32_t CM2Scene::s_optFlags = 0xFFFFFFFF;
 // STATIC: 0x00AF58A0
 static const float s_lightGridScale = 0.05f;
 
+// TROVICH: cell range of the 64 x 64 light grid (20 yd cells, wrapping) that a sphere covers along one axis.
+// Stock computes min / max cell & 63 and walks min..max: fine for the zero-radius spheres the stock client
+// lights models with, but a real bounding sphere can span 64 cells and more - the login screen model has a
+// 1213 yd radius - and then the walk covers (span mod 64) cells only and misses lamps (the dark portal).
+// Such a sphere walks the whole axis instead (each cell once).
+static void LightGridRange(float centre, float radius, uint32_t& first, uint32_t& last) {
+    float lo = floorf((centre - radius) * s_lightGridScale - 0.5f);
+    float hi = floorf((centre + radius) * s_lightGridScale + 0.5f);
+
+    if (!(hi - lo < 63.0f)) {
+        first = 0;
+        last = 63;
+        return;
+    }
+
+    first = static_cast<int32_t>(lo) & 0x3F;
+    last = static_cast<int32_t>(hi) & 0x3F;
+}
+
 // STATIC: 0x00D40DA0
 static uint32_t s_doodadHash[251];
 
@@ -849,6 +868,38 @@ void* CM2Scene::EndHitTestCollisionWorld(const C3Vector& start, const C3Vector& 
     return best->m_model->m_hitTestOwner;
 }
 
+// TROVICH: same light-grid walk as SelectLights, into a longer point-light list (terrain extra light passes)
+void CM2Scene::SelectPointLights(CM2LightList* list) {
+    for (CM2Light* light = this->m_lightList; light; light = light->m_lightNext) {
+        list->Add(light);
+    }
+
+    if (!this->m_lightGrid) {
+        return;
+    }
+
+    const CAaSphere& sphere = list->m_sphere;
+    uint32_t minX, maxX, minY, maxY;
+    LightGridRange(sphere.c.x, sphere.r, minX, maxX);  // TROVICH: was the stock range, wrapping for big spheres
+    LightGridRange(sphere.c.y, sphere.r, minY, maxY);
+
+    for (uint32_t x = minX; ; x = (x + 1) & 0x3F) {
+        for (uint32_t y = minY; ; y = (y + 1) & 0x3F) {
+            for (CM2Light* light = this->m_lightGrid[x + 64 * y]; light; light = light->m_lightNext) {
+                list->Add(light);
+            }
+
+            if (y == maxY) {
+                break;
+            }
+        }
+
+        if (x == maxX) {
+            break;
+        }
+    }
+}
+
 // VERIFY: c1963846 manual
 // OFFSET: 0x0081E400
 void CM2Scene::SelectLights(CM2Lighting* lighting) {
@@ -861,10 +912,9 @@ void CM2Scene::SelectLights(CM2Lighting* lighting) {
     }
 
     const CAaSphere& sphere = lighting->m_sphere4;
-    uint32_t maxX = static_cast<int32_t>(floorf((sphere.c.x + sphere.r) * s_lightGridScale + 0.5f)) & 0x3F;
-    uint32_t minY = static_cast<int32_t>(floorf((sphere.c.y - sphere.r) * s_lightGridScale - 0.5f)) & 0x3F;
-    uint32_t maxY = static_cast<int32_t>(floorf((sphere.r + sphere.c.y) * s_lightGridScale + 0.5f)) & 0x3F;
-    uint32_t minX = static_cast<int32_t>(floorf((sphere.c.x - sphere.r) * s_lightGridScale - 0.5f)) & 0x3F;
+    uint32_t minX, maxX, minY, maxY;
+    LightGridRange(sphere.c.x, sphere.r, minX, maxX);  // TROVICH: was the stock range, wrapping for big spheres
+    LightGridRange(sphere.c.y, sphere.r, minY, maxY);
 
     for (uint32_t x = minX; ; x = (x + 1) & 0x3F) {
         for (uint32_t y = minY; ; y = (y + 1) & 0x3F) {
@@ -873,11 +923,12 @@ void CM2Scene::SelectLights(CM2Lighting* lighting) {
             while (light) {
                 CM2Light* next = light->m_lightNext;
 
-                if (!light->m_scene || light->m_stamp == this->m_frameStamp) {
-                    lighting->AddLight(light);
-                } else {
-                    light->SetVisible(0);
-                }
+                // TROVICH: stock drops (and unlinks) every light whose model was not animated this frame
+                // (light->m_stamp != m_frameStamp) - i.e. as soon as the lamp model itself is culled, its
+                // light vanishes from everything it lights, although the lit area is still on screen:
+                // the flicker when the camera turns. Keep such a light at its last position; it is still
+                // unlinked when its model hides it (visibility track) or is destroyed (~CM2Light).
+                lighting->AddLight(light);
 
                 light = next;
             }

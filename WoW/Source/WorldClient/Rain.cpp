@@ -1,5 +1,6 @@
 #include "Rain.h"
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include "Engine/Source/Base/Handle.h"
 #include "Engine/Source/ConsoleBase/ConsoleVar.h"
@@ -403,6 +404,81 @@ void Rain::UpdatePackets() {
     }
 }
 
+// TROVICH: lamps glinting in the rain. Stock drops and splashes are drawn with Mod2x blending (they only
+// scale what is behind them), so they never show a lamp's light. For every drop / splash a lamp reaches, a
+// copy of its triangle is kept with the lamp light at that point as vertex colour, and after the stock pass
+// all copies are drawn at once with additive alpha blending (Add: colour * texture alpha added) - a glint
+// in the lamp's colour, shaped and faded by the drop texture. Far from lamps nothing changes.
+static const uint32_t kRainGlintMax = 3 * 8192;
+static const float kRainGlintStrength = 0.8f;
+static WeatherLights s_rainGlintLights;
+static CGxVertexPCT s_rainGlints[kRainGlintMax];
+static uint32_t s_rainGlintCount;
+
+static void TrovichRainGlintsBegin(const C3Vector& camera) {
+    s_rainGlintCount = 0;
+    s_rainGlintLights.Gather(camera, 75.0f);
+}
+
+// tri: the 3 camera-relative vertices just written for the drop / splash; point: its world position
+static void TrovichRainGlintAdd(const CGxVertexPT* tri, const C3Vector& point) {
+    if (!s_rainGlintLights.m_count || s_rainGlintCount + 3 > kRainGlintMax) {
+        return;
+    }
+
+    C3Vector light = s_rainGlintLights.At(point);
+    float r = light.x * kRainGlintStrength;
+    float g = light.y * kRainGlintStrength;
+    float b = light.z * kRainGlintStrength;
+
+    if (r < 0.02f && g < 0.02f && b < 0.02f) {
+        return;
+    }
+
+    CImVector color;
+    color.r = static_cast<uint8_t>(r >= 1.0f ? 255 : static_cast<int32_t>(r * 255.0f));
+    color.g = static_cast<uint8_t>(g >= 1.0f ? 255 : static_cast<int32_t>(g * 255.0f));
+    color.b = static_cast<uint8_t>(b >= 1.0f ? 255 : static_cast<int32_t>(b * 255.0f));
+    color.a = 0xFF;
+    GxFormatColor(color);
+
+    for (uint32_t k = 0; k < 3; k++) {
+        CGxVertexPCT& v = s_rainGlints[s_rainGlintCount++];
+        v.p = tri[k].p;
+        v.c = color;
+        v.tc = tri[k].tc;
+    }
+}
+
+// inside the stock pass's RsPush / RsPop, with its texture still bound
+static void TrovichRainGlintsDraw() {
+    if (!s_rainGlintCount) {
+        return;
+    }
+
+    GxRsSet(GxRs_BlendingMode, GxBlend_Add);
+    GxRsSet(GxRs_AlphaRef, static_cast<int32_t>(CGxDevice::s_alphaRef[GxBlend_Add]));
+    GxRsSet(GxRs_MatDiffuse, static_cast<int32_t>(0xFFFFFFFF));
+    GxRsSet(GxRs_FogColor, 0);
+
+    CGxBuf* buf = g_theGxDevicePtr->BufStream(GxPoolTarget_Vertex, sizeof(CGxVertexPCT), s_rainGlintCount);
+    CGxVertexPCT* vertices = reinterpret_cast<CGxVertexPCT*>(g_theGxDevicePtr->BufLock(buf));
+    memcpy(vertices, s_rainGlints, sizeof(CGxVertexPCT) * s_rainGlintCount);
+    g_theGxDevicePtr->BufUnlock(buf, 0);
+    buf->m_hasData = 1;
+
+    GxPrimVertexPtr(buf, GxVBF_PCT);
+    CGxBatch batch;
+    batch.m_primType = GxPrim_Triangles;
+    batch.m_start = 0;
+    batch.m_count = s_rainGlintCount;
+    batch.m_minIndex = 0;
+    batch.m_maxIndex = 0;
+    g_theGxDevicePtr->Draw(&batch, 0);
+    s_rainGlintCount = 0;
+}
+
+
 // VERIFY: e7a71254 manual
 // OFFSET: 0x007891B0
 void Rain::RenderPatterPacketsSW() {
@@ -436,6 +512,7 @@ void Rain::RenderPatterPacketsSW() {
     C3Vector up(view.a1 * 0.16666667f, view.b1 * 0.16666667f, view.c1 * 0.16666667f);
     C3Vector left(-right.x, -right.y, -right.z);
     C3Vector camera = *World::GetCamPos();
+    TrovichRainGlintsBegin(camera);  // TROVICH
     uint32_t now = CWorld::s_elapsedTicks;
 
     for (Packet<RainPatterParticleBuffer>* packet = this->m_rainPatterPacketList.m_activePackets.Head(); packet; packet = this->m_rainPatterPacketList.m_activePackets.Next(packet)) {
@@ -478,6 +555,7 @@ void Rain::RenderPatterPacketsSW() {
             vertices[2].p = center + right;
             vertices[2].tc.x = u + 0.25f;
             vertices[2].tc.y = v + 0.25f;
+            TrovichRainGlintAdd(vertices, particle.m_position);  // TROVICH
             vertices += 3;
             vertexCount += 3;
         }
@@ -497,6 +575,7 @@ void Rain::RenderPatterPacketsSW() {
         }
     }
 
+    TrovichRainGlintsDraw();  // TROVICH
     g_theGxDevicePtr->RsPop();
 }
 
@@ -528,6 +607,7 @@ void Rain::RenderDropPacketsSW() {
     GxRsSet(GxRs_FogColor, static_cast<int32_t>(0x80808080));
     GxRsSet(GxRs_Texture0, texture);
     C3Vector camera = *World::GetCamPos();
+    TrovichRainGlintsBegin(camera);  // TROVICH
     uint32_t now = CWorld::s_elapsedTicks;
     C33Matrix blur(1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f);
     Rain::GetMotionBlurMatrix(&blur);
@@ -583,6 +663,7 @@ void Rain::RenderDropPacketsSW() {
             vertices[2].p.y = blur.b0 * streak.x + blur.b1 * streak.y + blur.b2 * streak.z + tail.y;
             vertices[2].p.z = blur.c0 * streak.x + blur.c1 * streak.y + blur.c2 * streak.z + tail.z;
             vertices[2].tc = tex2;
+            TrovichRainGlintAdd(vertices, head + camera);  // TROVICH
             vertices += 3;
             vertexCount += 3;
         }
@@ -602,6 +683,7 @@ void Rain::RenderDropPacketsSW() {
         }
     }
 
+    TrovichRainGlintsDraw();  // TROVICH
     g_theGxDevicePtr->RsPop();
 }
 
@@ -680,6 +762,38 @@ void Rain::RenderPatterPackets() {
         batch.m_minIndex = 0;
         batch.m_maxIndex = 0;
         g_theGxDevicePtr->Draw(&batch, 0);
+    }
+
+    // TROVICH: lamp glints - the same packets again with TrovichRainGlint / TrovichPatterGlint (stock geometry,
+    // colour = lamp light at the drop / splash), additive with alpha, black fog. Nothing is drawn without lamps.
+    if (CGxShader* glint = WeatherLights::Shader(WeatherLights::SHADER_PATTER)) {
+        static WeatherLights s_lights;
+        s_lights.Gather(*World::GetCamPos(), 75.0f);
+
+        if (s_lights.m_count) {
+            s_lights.SetVertexConstants(C3Vector(0.0f, 0.0f, 0.0f), 0.8f);
+            GxRsSet(GxRs_BlendingMode, GxBlend_Add);
+            GxRsSet(GxRs_AlphaRef, static_cast<int32_t>(CGxDevice::s_alphaRef[GxBlend_Add]));
+            GxRsSet(GxRs_FogColor, 0);
+            g_theGxDevicePtr->RsSet(GxRs_VertexShader, glint);
+
+            for (Packet<RainPatterParticleBuffer>* packet = this->m_rainPatterPacketList.m_activePackets.Head(); packet; packet = this->m_rainPatterPacketList.m_activePackets.Next(packet)) {
+                if (packet->m_packetStartTick >= now) {
+                    continue;
+                }
+
+                float age[4] = { (now - packet->m_packetStartTick) * 0.0009765625f, 0.0f, 0.0f, 0.0f };
+                g_theGxDevicePtr->ShaderConstantsSet(GxSh_Vertex, 6, age, 1);
+                GxPrimVertexPtr(packet->m_vertexBufHandle, GxVBF_PCT);
+                CGxBatch batch;
+                batch.m_primType = GxPrim_Triangles;
+                batch.m_start = 0;
+                batch.m_count = 3 * packet->m_currParticle;
+                batch.m_minIndex = 0;
+                batch.m_maxIndex = 0;
+                g_theGxDevicePtr->Draw(&batch, 0);
+            }
+        }
     }
 
     g_theGxDevicePtr->RsPop();
@@ -773,6 +887,38 @@ void Rain::RenderDropPackets() {
         batch.m_minIndex = 0;
         batch.m_maxIndex = 0;
         g_theGxDevicePtr->Draw(&batch, 0);
+    }
+
+    // TROVICH: lamp glints - the same packets again with TrovichRainGlint / TrovichPatterGlint (stock geometry,
+    // colour = lamp light at the drop / splash), additive with alpha, black fog. Nothing is drawn without lamps.
+    if (CGxShader* glint = WeatherLights::Shader(WeatherLights::SHADER_RAIN)) {
+        static WeatherLights s_lights;
+        s_lights.Gather(*World::GetCamPos(), 75.0f);
+
+        if (s_lights.m_count) {
+            s_lights.SetVertexConstants(C3Vector(0.0f, 0.0f, 0.0f), 0.8f);
+            GxRsSet(GxRs_BlendingMode, GxBlend_Add);
+            GxRsSet(GxRs_AlphaRef, static_cast<int32_t>(CGxDevice::s_alphaRef[GxBlend_Add]));
+            GxRsSet(GxRs_FogColor, 0);
+            g_theGxDevicePtr->RsSet(GxRs_VertexShader, glint);
+
+            for (Packet<RainParticleBuffer>* packet = this->m_rainDropPacketList.m_activePackets.Head(); packet; packet = this->m_rainDropPacketList.m_activePackets.Next(packet)) {
+                if (packet->m_packetStartTick >= now) {
+                    continue;
+                }
+
+                float age[4] = { (now - packet->m_packetStartTick) * 0.0009765625f, 0.0f, 0.0f, 0.0f };
+                g_theGxDevicePtr->ShaderConstantsSet(GxSh_Vertex, 6, age, 1);
+                GxPrimVertexPtr(packet->m_vertexBufHandle, GxVBF_PNCT);
+                CGxBatch batch;
+                batch.m_primType = GxPrim_Triangles;
+                batch.m_start = 0;
+                batch.m_count = 3 * packet->m_currParticle;
+                batch.m_minIndex = 0;
+                batch.m_maxIndex = 0;
+                g_theGxDevicePtr->Draw(&batch, 0);
+            }
+        }
     }
 
     g_theGxDevicePtr->RsPop();

@@ -15,6 +15,7 @@ class CImVector;
 class CM2Cache;
 class CM2Light;
 class CM2Lighting;
+class CM2LightList;
 class CM2Model;
 class CParticleEmitter2;
 class CShaderEffect;
@@ -119,6 +120,7 @@ class CM2Scene {
     void PurgeModelCache();
     void Release();
     void SelectLights(CM2Lighting* lighting);
+    void SelectPointLights(CM2LightList* list);  // TROVICH
     void SetFloat18(float value);
     void SetProjectPositionCallback(int32_t (*callback)(const C3Vector&, float&, void*), void* param);
     void SetProjectTextureCallback(void (*callback)(const CAaBox&, const CImVector&, int32_t, void*, int32_t), void* param);

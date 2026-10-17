@@ -855,6 +855,216 @@ void CMapObj::TransformPortal(SMOPortal* portal, SPortalExt* portalExt) {
     }
 }
 
+// TROVICH: every point light reaching the WMO group being drawn (World.cpp fills it next to the group's
+// CM2Lighting, which keeps only 4 for the whole group - a Stormwind district is ONE group); empty while
+// no group is being drawn. s_groupStockLightCount = the CM2Lighting's count (the stock permutation).
+CM2LightList CMapObj::s_groupLights;
+uint32_t CMapObj::s_groupStockLightCount;
+C44Matrix CMapObj::s_mapObjWorld;
+CGxShader* CMapObj::s_lightOnlyVertexShader;
+CGxShader* CMapObj::s_pixelLightVertexShader;
+CGxShader* CMapObj::s_pixelLightPixelShader[2];
+int32_t CMapObj::s_extraLightShadersTried;
+
+// TROVICH: shaders of client-patches/decomp-shaders (patch-enGB-4), created on first use
+static void LoadExtraLightShaders() {
+    if (CMapObj::s_extraLightShadersTried) {
+        return;
+    }
+
+    CMapObj::s_extraLightShadersTried = 1;
+    g_theGxDevicePtr->ShaderCreate(&CMapObj::s_lightOnlyVertexShader, GxSh_Vertex, "Shaders\\Vertex", "TrovichMapObjLights", 1);
+    g_theGxDevicePtr->ShaderCreate(&CMapObj::s_pixelLightVertexShader, GxSh_Vertex, "Shaders\\Vertex", "TrovichMapObjPixelLights", 1);
+    g_theGxDevicePtr->ShaderCreate(&CMapObj::s_pixelLightPixelShader[0], GxSh_Pixel, "Shaders\\Pixel", "TrovichMapObjPixelLightsOpaque", 1);
+    g_theGxDevicePtr->ShaderCreate(&CMapObj::s_pixelLightPixelShader[1], GxSh_Pixel, "Shaders\\Pixel", "TrovichMapObjPixelLightsAlpha", 1);
+}
+
+static bool ShaderUsable(CGxShader* shader) {
+    return shader && shader->Valid();
+}
+
+// TROVICH: whether this opaque batch gets ALL its point lights per pixel from RenderExtraLightPasses (then its
+// normal pass uses the stock 0-light permutation). Lit materials of the plain effects only (Diffuse, Specular,
+// Opaque - Env / Metal would add their reflection again), opaque or alpha-keyed (blend 0 / 1).
+int32_t CMapObj::UsePixelLights(uint32_t shader, uint32_t blendMode) {
+    if (!CMapObj::s_groupLights.m_count || !CShaderEffect::s_enableShaders || !CMapObj::s_lightingMode) {
+        return 0;
+    }
+
+    if ((shader != 0 && shader != 1 && shader != 4) || blendMode > 1) {
+        return 0;
+    }
+
+    LoadExtraLightShaders();
+
+    return ShaderUsable(CMapObj::s_pixelLightVertexShader) && ShaderUsable(CMapObj::s_pixelLightPixelShader[0]) && ShaderUsable(CMapObj::s_pixelLightPixelShader[1]);
+}
+
+// TROVICH: call right before CMapObj::SelectWorldShaders of an opaque batch: picks the light-count
+// permutation of its normal pass
+void CMapObj::BeginBatchLights(uint32_t shader, uint32_t blendMode) {
+    CWorldScene::s_fogPermute = CMapObj::UsePixelLights(shader, blendMode) ? 0 : CMapObj::s_groupStockLightCount;
+}
+
+static void SetBlackFog(int32_t fogInRenderState) {
+    if (fogInRenderState) {
+        GxRsSet(GxRs_FogColor, 0);
+    } else {
+        // keep .w: it carries the alpha reference for the pixel shader
+        C4Vector black;
+        black.x = 0.0f;
+        black.y = 0.0f;
+        black.z = 0.0f;
+        black.w = CShaderEffect::s_fogColorAlphaRef.w;
+        GxShaderConstantsSet(GxSh_Pixel, 2, &black.x, 1);
+    }
+}
+
+// TROVICH: per-pixel pass constants: 8 lights, pixel c20..c27 colour, c28..c35 view-space position,
+// c36..c43 attenuation (constant, linear, quadratic) - see TrovichMapObjPixelLights.hlsl
+static void SetPixelPassLights(CM2Light** lights, uint32_t count) {
+    const uint32_t passLights = 8;
+    C4Vector constants[3 * passLights];
+    C44Matrix view;
+    GxXformView(view);
+
+    for (uint32_t i = 0; i < passLights; i++) {
+        C4Vector& color = constants[i];
+        C4Vector& position = constants[passLights + i];
+        C4Vector& attenuation = constants[2 * passLights + i];
+
+        if (i < count) {
+            CM2Light* light = lights[i];
+            C3Vector viewPos = (light->m_pos - CWorldScene::s_activeWorldView) * view;
+            color.x = light->m_dirColor.x;
+            color.y = light->m_dirColor.y;
+            color.z = light->m_dirColor.z;
+            position.x = viewPos.x;
+            position.y = viewPos.y;
+            position.z = viewPos.z;
+            attenuation.x = light->m_constantAttenuation;
+            attenuation.y = light->m_linearAttenuation;
+            attenuation.z = light->m_quadraticAttenuation;
+        } else {
+            color.x = 0.0f;
+            color.y = 0.0f;
+            color.z = 0.0f;
+            position.x = 0.0f;
+            position.y = 0.0f;
+            position.z = 0.0f;
+            attenuation.x = 1.0f;
+            attenuation.y = 0.0f;
+            attenuation.z = 0.0f;
+        }
+
+        color.w = 0.0f;
+        position.w = 1.0f;
+        attenuation.w = 0.0f;
+    }
+
+    g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 20, &constants[0].x, 3 * passLights);
+}
+
+// TROVICH: extra additive passes for the point lights of an opaque WMO batch, right after its normal Draw.
+// Per pixel (UsePixelLights): every group light that reaches the batch's bounding box (LightReach), 8 per
+// pass, TrovichMapObjPixelLights + ...Opaque / ...Alpha - big floor triangles and group borders no longer
+// matter, and big groups (Stormwind's canals / districts are single groups of 200+ yd) keep all their lamps.
+// Otherwise (no SM3, other materials): the lights beyond the stock 4, per vertex, with TrovichMapObjLights
+// (lights only: no ambient, sun, baked vertex colour or emissive).
+// Stock colour = sat(c28 * sat(ambient + sun + lights) + v2 + c29).
+void CMapObj::RenderExtraLightPasses(CGxBatch draw, const SMOBatch& batch, uint32_t shader, uint32_t blendMode) {
+    uint32_t total = CMapObj::s_groupLights.m_count;
+    int32_t perPixel = CMapObj::UsePixelLights(shader, blendMode);
+
+    CWorldScene::s_fogPermute = CMapObj::s_groupStockLightCount;  // for whatever is drawn next
+
+    if (!total || !CShaderEffect::s_enableShaders || !CMapObj::s_lightingMode) {
+        return;
+    }
+
+    // the lights to draw
+    CM2Light* lights[CM2LightList::CAPACITY];
+    uint32_t count = 0;
+
+    if (perPixel) {
+        // the batch's box (WMO local) as a world-space sphere
+        C3Vector b(batch.m_bx, batch.m_by, batch.m_bz);
+        C3Vector t(batch.m_tx, batch.m_ty, batch.m_tz);
+        C3Vector centre((b.x + t.x) * 0.5f, (b.y + t.y) * 0.5f, (b.z + t.z) * 0.5f);
+        C3Vector half((t.x - b.x) * 0.5f, (t.y - b.y) * 0.5f, (t.z - b.z) * 0.5f);
+        float radius = sqrtf(half.x * half.x + half.y * half.y + half.z * half.z);
+        C3Vector worldCentre = centre * CMapObj::s_mapObjWorld;
+
+        for (uint32_t i = 0; i < total; i++) {
+            CM2Light* light = CMapObj::s_groupLights.m_lights[i];
+            C3Vector d = light->m_pos - worldCentre;
+            float reach = M2LightReach(light) + radius;
+
+            if (d.x * d.x + d.y * d.y + d.z * d.z <= reach * reach) {
+                lights[count++] = light;
+            }
+        }
+    } else {
+        if (total <= 4 || (shader != 0 && shader != 1 && shader != 4)) {
+            return;
+        }
+
+        for (uint32_t i = 4; i < total; i++) {
+            lights[count++] = CMapObj::s_groupLights.m_lights[i];
+        }
+    }
+
+    if (!count) {
+        return;
+    }
+
+    LoadExtraLightShaders();
+
+    if (!perPixel && !ShaderUsable(CMapObj::s_lightOnlyVertexShader)) {
+        return;
+    }
+
+    int32_t fogInRenderState = g_theGxDevicePtr->Caps().unk_0134;
+
+    g_theGxDevicePtr->RsPush();
+    GxRsSet(GxRs_BlendingMode, GxBlend_NoAlphaAdd);
+    CShaderEffect::SetAlphaRefDefault();
+    GxRsSet(GxRs_DepthWrite, 0);
+    SetBlackFog(fogInRenderState);
+
+    if (perPixel) {
+        g_theGxDevicePtr->RsSet(GxRs_VertexShader, CMapObj::s_pixelLightVertexShader);
+        g_theGxDevicePtr->RsSet(GxRs_PixelShader, CMapObj::s_pixelLightPixelShader[blendMode == 1 ? 1 : 0]);
+
+        for (uint32_t first = 0; first < count; first += 8) {
+            SetPixelPassLights(&lights[first], count - first < 8 ? count - first : 8);
+            g_theGxDevicePtr->Draw(&draw, 1);
+        }
+    } else {
+        g_theGxDevicePtr->RsSet(GxRs_VertexShader, CMapObj::s_lightOnlyVertexShader);
+
+        for (uint32_t first = 0; first < count; first += 4) {
+            LocalLights localLights;
+            CShaderEffect::ComputeLocalLights(&localLights, count - first < 4 ? count - first : 4, &lights[first], &CWorldScene::s_activeWorldView);
+            g_theGxDevicePtr->ShaderConstantsSet(GxSh_Vertex, 17, reinterpret_cast<float*>(&localLights), 11);
+            g_theGxDevicePtr->Draw(&draw, 1);
+        }
+    }
+
+    g_theGxDevicePtr->RsPop();
+
+    if (!perPixel) {
+        // back to the group's own first 4 lights (the ones CM2Lighting kept: same candidates, same key)
+        LocalLights localLights;
+        CShaderEffect::ComputeLocalLights(&localLights, 4, CMapObj::s_groupLights.m_lights, &CWorldScene::s_activeWorldView);
+        g_theGxDevicePtr->ShaderConstantsSet(GxSh_Vertex, 17, reinterpret_cast<float*>(&localLights), 11);
+    }
+
+    if (!fogInRenderState) {
+        GxShaderConstantsSet(GxSh_Pixel, 2, &CShaderEffect::s_fogColorAlphaRef.x, 1);
+    }
+}
+
 // VERIFY: b0d6c3f6 auto
 // OFFSET: 0x007A9160
 void CWorldScene::SetupLighting(CM2Lighting* lighting, C3Vector* view) {
@@ -1025,6 +1235,7 @@ void CMapObj::UnifiedRender(CMapObjGroup* group, uint32_t index) {
 
             GxRsSet(GxRs_BlendingMode, static_cast<int32_t>(material.m_blendMode));
             CShaderEffect::SetAlphaRefDefault();
+            CMapObj::BeginBatchLights(shader, material.m_blendMode);  // TROVICH
             CMapObj::SelectWorldShaders();
             CGxBatch draw;
             draw.m_primType = GxPrim_Triangles;
@@ -1033,6 +1244,7 @@ void CMapObj::UnifiedRender(CMapObjGroup* group, uint32_t index) {
             draw.m_minIndex = batch.m_vertexStart;
             draw.m_maxIndex = batch.m_vertexEnd;
             g_theGxDevicePtr->Draw(&draw, 1);
+            CMapObj::RenderExtraLightPasses(draw, batch, shader, material.m_blendMode);  // TROVICH
             continue;
         }
 
@@ -1558,6 +1770,7 @@ void CMapObj::InteriorRender(CMapObjGroup* group, uint32_t index) {
 
             GxRsSet(GxRs_BlendingMode, static_cast<int32_t>(material.m_blendMode));
             CShaderEffect::SetAlphaRefDefault();
+            CMapObj::BeginBatchLights(shader, material.m_blendMode);  // TROVICH
             CMapObj::SelectWorldShaders();
             CGxBatch draw;
             draw.m_primType = GxPrim_Triangles;
@@ -1566,6 +1779,7 @@ void CMapObj::InteriorRender(CMapObjGroup* group, uint32_t index) {
             draw.m_minIndex = batch.m_vertexStart;
             draw.m_maxIndex = batch.m_vertexEnd;
             g_theGxDevicePtr->Draw(&draw, 1);
+            CMapObj::RenderExtraLightPasses(draw, batch, shader, material.m_blendMode);  // TROVICH
             continue;
         }
 

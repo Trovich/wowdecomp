@@ -3019,12 +3019,21 @@ void CWorldScene::RenderMapObjDefGroups() {
             DayNight::DNInfo* info = DayNight::GetInfo();
             CWorldScene::SetupLighting(&lighting, &CWorldScene::s_activeWorldView);
 
+            // TROVICH: all point lights of the group (same candidates and key as `lighting`, which keeps 4)
+            // for CMapObj::RenderExtraLightPasses
+            CMapObj::s_groupStockLightCount = lighting.m_lightCount;
+            CMapObj::s_mapObjWorld = mapObjDef->m_mat;  // batch boxes (WMO local) -> world, for the light filter
+            CMapObj::s_groupLights.Reset(group->m_sphere);
+            World::s_m2Scene->SelectPointLights(&CMapObj::s_groupLights);
+            group->SelectPointLights(&CMapObj::s_groupLights);
+
             if (static_cast<uint32_t>(mapObjDef->m_objectGuid.m_guid) && mapObjDef->m_objectGuid == s_highlightedObjectGuid) {
                 CMapObj::SetEmissiveAmbient(info->m_light1.m_ambient);
             }
 
             s_curGroupIsInterior = interior;
             mapObj->RenderGroup(group->m_groupNum, mapObjDef->m_invMat, &group->m_frustumList);
+            CMapObj::s_groupLights.m_count = 0;  // TROVICH: no extra light passes outside this loop
         }
 
         CWFrustum* frustum = group->m_frustumList.Head();

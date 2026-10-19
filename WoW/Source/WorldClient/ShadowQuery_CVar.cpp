@@ -8,3 +8,6 @@ CVar* g_shadowScissor;
 
 // STATIC: 0x00D25314
 CVar* g_shadowInstancing;
+
+// TROVICH: terrain chunks cast dynamic shadows (ShadowQuery.cpp)
+CVar* g_shadowTerrain;

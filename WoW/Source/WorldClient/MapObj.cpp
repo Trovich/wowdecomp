@@ -1651,6 +1651,9 @@ void CMapObj::ExteriorRender(CMapObjGroup* group, uint32_t index) {
         g_theGxDevicePtr->RsSet(GxRs_Texture0, gxTex0);
         g_theGxDevicePtr->RsSet(GxRs_Texture1, gxTex1);
         effect->SetCurrent();
+        // TROVICH: groups without vertex colours (most small "collidable doodad" WMOs: scaffolding, gates)
+        // come here, not to UnifiedRender - the same extra light passes (c28 / vertex colour are 0x7F7F7F as there)
+        CMapObj::BeginBatchLights(shader, material.m_blendMode);
         CMapObj::SelectWorldShaders();
         CGxBatch draw;
         draw.m_primType = GxPrim_Triangles;
@@ -1659,6 +1662,7 @@ void CMapObj::ExteriorRender(CMapObjGroup* group, uint32_t index) {
         draw.m_minIndex = batch.m_vertexStart;
         draw.m_maxIndex = batch.m_vertexEnd;
         g_theGxDevicePtr->Draw(&draw, 1);
+        CMapObj::RenderExtraLightPasses(draw, batch, shader, material.m_blendMode);  // TROVICH
     }
 
     g_theGxDevicePtr->RsPop();
@@ -3348,6 +3352,9 @@ bool CMapObj::VectorIntersectPortals(uint32_t groupNum, C3Segment& seg, float* t
 
 // VERIFY: e67c38fa manual
 // OFFSET: 0x007AB760
+// TROVICH
+float CMapObj::s_shadowAlphaRef = 0.87843138f;
+
 void CMapObj::RenderMapObjGroupsShadowMap(void* groups, uint32_t count, void* groupData, const C44Matrix& translation, CFrustum& frustum) {
     CAaBox box;
     box.b.x = 0.0f;
@@ -3398,7 +3405,7 @@ void CMapObj::RenderMapObjGroupsShadowMap(void* groups, uint32_t count, void* gr
             continue;
         }
 
-        CShaderEffect::SetAlphaRef(0.87843138f);
+        CShaderEffect::SetAlphaRef(CMapObj::s_shadowAlphaRef);  // TROVICH: was 0.87843138f
         CShaderEffect::SetDefaultShaders(0);
 
         for (int32_t j = 0; j < group->m_batchListCount; j++) {
@@ -3411,7 +3418,7 @@ void CMapObj::RenderMapObjGroupsShadowMap(void* groups, uint32_t count, void* gr
             }
 
             g_theGxDevicePtr->RsSet(GxRs_Texture0, gxTex);
-            constants[3] = material.m_blendMode == 1 ? 0.87843138f : 0.0f;
+            constants[3] = material.m_blendMode == 1 ? CMapObj::s_shadowAlphaRef : 0.0f;  // TROVICH: was 0.87843138f
             g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 2, constants, 1);
             CGxBatch batch;
             batch.m_primType = GxPrim_Triangles;

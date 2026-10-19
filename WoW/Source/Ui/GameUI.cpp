@@ -172,6 +172,7 @@
 #include "Engine/Source/Tempest/C33Matrix.h"
 #include "WoW/Source/DB/Rec/CreatureFamilyRec.h"
 #include "WoW/Source/DB/Rec/CreatureTypeRec.h"
+#include "WoW/Source/WorldClient/TrovichFog.h"
 
 // STATIC: 0x00ACC3F8
 CImVector s_deadSelectionColor = CImVector(0x7F, 0x7F, 0x7F, 0xFF);
@@ -6637,6 +6638,7 @@ int32_t CGGameUI::MessageHandler(void* param, NETMESSAGE msgId, uint32_t time, C
             }
 
             World::s_weather->SetType(type, intensity, rec, abrupt == 0, transition);
+            TrovichFog::SetWeather(weatherId, intensity);  // TROVICH: weather-driven fog presets
 
             if (soundKitId <= 0) {
                 soundKitId = -1;

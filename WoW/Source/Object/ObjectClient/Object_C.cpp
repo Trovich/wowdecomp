@@ -312,6 +312,11 @@ void CGObject_C::Reenable() {
     this->m_scaleChangeTime = 0;
     uint32_t time = this->ShouldFadeIn() ? 1000 : 0;
     this->DoFade(this->GetBaseAlpha(), time);
+
+    // TROVICH: its model's lights back on (Disable switched them off)
+    if (CM2Model* model = this->GetObjectModel()) {
+        model->SetAllLightsEnabled(1);
+    }
 }
 
 // VERIFY: 9f30bf9a auto
@@ -339,6 +344,12 @@ void CGObject_C::Disable() {
     this->m_alpha = 0;
     this->m_modelFlags = (this->m_modelFlags & 0xF8FFFFFF) | 0x10000;
     this->m_disableTime = FrameTime::s_curTimeMs;
+
+    // TROVICH: a removed / out-of-range object keeps its model (lazy cleanup) - switch its lights off now,
+    // or a removed lamp keeps lighting the world until relog (see CM2Model::SetAllLightsEnabled)
+    if (CM2Model* model = this->GetObjectModel()) {
+        model->SetAllLightsEnabled(0);
+    }
 }
 
 // VERIFY: 890fb3ed auto

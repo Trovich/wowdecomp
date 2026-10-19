@@ -5,6 +5,7 @@
 #include "Engine/Source/Os/TimeManager.h"
 #include "Engine/Source/lua-5.1/src/lauxlib.h"
 #include "Engine/Source/lua-5.1/src/lua.h"
+#include "WoW/Source/WorldClient/TrovichFog.h"  // TROVICH
 #include "WoW/Source/Game/GameTime.h"
 #include "WoW/Source/Ui/ScriptEvents.h"
 #include "Engine/Source/FrameXML/LoadXML.h"
@@ -4365,6 +4366,8 @@ static FrameScript_Method s_SystemFunctions[] = {
     { "GetTime", &Script_GetTime },
     { "GetGameTime", &Script_GetGameTime },
     { "ConsoleExec", &Script_ConsoleExec },
+    { "TrovichFogPosition", &TrovichFog::ScriptPosition },  // TROVICH: volumetric fog banks
+    { "TrovichFogLight", &TrovichFog::ScriptLight },        // TROVICH
     { "ReadFile", &Script_ReadFile },
     { "DeleteFile", &Script_DeleteFile },
     { "AppendToFile", &Script_AppendToFile },

@@ -255,6 +255,27 @@ void CM2Model::SetLightEnabled(uint32_t index, uint32_t enabled) {
     }
 }
 
+// TROVICH: all of the model's own lights on / off at once (CGObject_C::Disable / Reenable). Off also unlinks
+// them right away: CM2Scene::SelectLights keeps lights whose model was not animated this frame (lamps culled
+// from view), so a light of a model that is never animated again - a removed object waits up to minutes in the
+// object manager's lazy-cleanup list before its model is released - would otherwise stay in the world.
+// Animate turns a light visible again only while m_enabled is set.
+void CM2Model::SetAllLightsEnabled(uint32_t enabled) {
+    if (!(this->m_fFlags & 1) || !this->m_lights) {
+        return;
+    }
+
+    M2Data* data = this->m_shared->m_data;
+
+    for (uint32_t i = 0; i < data->m_lights.m_count; i++) {
+        this->m_lights[i].m_enabled = enabled;
+
+        if (!enabled) {
+            this->m_lights[i].m_light.SetVisible(0);
+        }
+    }
+}
+
 // VERIFY: 15a8f3dc auto
 // OFFSET: 0x00824170
 void* CM2Model::GetCameraByIndex(uint32_t index) {
@@ -4530,12 +4551,16 @@ int32_t CM2Model::SetVerticesMultiSample(int32_t optimized, M2SkinSection* secti
 
 // VERIFY: 7330ed7c manual
 // OFFSET: 0x0082DA40
+// TROVICH
+float CM2Model::s_shadowAlphaRef = 0.50196081f;
+int32_t CM2Model::s_cameraDepthPass;
+
 void CM2Model::RenderModelBatchesShadowMap(const CModelBatchList& untextured, const CModelBatchList& textured) {
     GxRsSet(GxRs_BlendingMode, static_cast<int32_t>(0));
     CShaderEffect::SetAlphaRef(0.0f);
     CShaderEffect::SetDefaultShaders(0);
     CM2Model::RenderModelBatchListShadowMap(1, untextured);
-    CShaderEffect::SetAlphaRef(0.50196081f);
+    CShaderEffect::SetAlphaRef(CM2Model::s_shadowAlphaRef);  // TROVICH: was 0.50196081f
     CShaderEffect::SetDefaultShaders(0);
     CM2Model::RenderModelBatchListShadowMap(0, textured);
 }
@@ -6185,7 +6210,9 @@ void CM2Model::AnimateSM() {
         return;
     }
 
-    if (this->m_attachParent || this->m_shared->m_billboardBoneCount) {
+    // TROVICH: the fog's camera depth pass must see the model in the pose it is drawn in this frame - the stock
+    // shortcut (bone 0 only, the other bones left from the last frame) showed tree crowns beside themselves
+    if (this->m_attachParent || this->m_shared->m_billboardBoneCount || CM2Model::s_cameraDepthPass) {
         this->Animate();
         return;
     }
@@ -7745,7 +7772,12 @@ void CM2Model::GatherModelBatchesShadowMap(CModelBatchList& untextured, CModelBa
         M2Data* data = this->m_shared->m_data;
         M2Material* material = &data->m_materials[batch->m_materialIndex];
 
-        if ((material->m_flags & 0x40) || (!(material->m_flags & 0x80) && material->m_blendMode > 1)) {
+        // TROVICH: the fog's camera pass takes the alpha-BLENDED batches too (blend mode 2, alpha tested there at
+        // s_shadowAlphaRef): leaf cards drawn that way are in front of the fog - without them the fog of the sky
+        // behind showed through the crowns
+        int32_t maxBlend = CM2Model::s_cameraDepthPass ? 2 : 1;
+
+        if ((material->m_flags & 0x40) || (!(material->m_flags & 0x80) && material->m_blendMode > maxBlend)) {
             continue;
         }
 
@@ -7759,7 +7791,7 @@ void CM2Model::GatherModelBatchesShadowMap(CModelBatchList& untextured, CModelBa
             alpha *= this->m_textureWeights[data->m_textureWeightCombos[batch->m_textureWeightComboIndex]].m_currentValue;
         }
 
-        if (alpha >= 0.55000001f) {
+        if (alpha >= (CM2Model::s_cameraDepthPass ? 0.3f : 0.55000001f)) {  // TROVICH: fading-in doodads for the camera
             (material->m_blendMode ? textured : untextured).Add(this, i);
         }
     }

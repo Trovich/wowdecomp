@@ -254,6 +254,9 @@ namespace DayNight {
     void DoAreaLights(CurrentLight* light, int32_t underwater);
     void UpdateFog();
     void SetDirection();
+    // TROVICH: unit vector toward the sun or the moon, whichever is up, where it is drawn (the light direction
+    // SetDirection gives lighting and shadows is held 15 degrees up). False without sunPath.
+    bool TrovichLightBody(C3Vector& toward, bool* moon = nullptr);
     void UpdateLighting();
     void Update(int32_t reset, const C3Vector* cameraPos);
     void SetColors();

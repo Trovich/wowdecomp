@@ -99,6 +99,7 @@
 #include <cstring>
 #include "WoW/Source/Object/ObjectClient/Object_C.h"
 #include "WoW/Source/Game/GameClient/ProjectTex.h"
+#include "WoW/Source/WorldClient/TrovichFog.h"
 
 // STATIC: 0x00ADEE48
 static const char* s_zonePaths[11] = {
@@ -1325,6 +1326,11 @@ float World::ValidateFarClip(float farClip, int32_t mapID) {
         }
     } else if (OsGetPhysicalMemory() <= 0x40000000) {
         maxFarClip = 2375.0f / 3.0f;
+    }
+
+    // TROVICH: with the volumetric fog the view may reach much farther - the far haze, not a wall, ends it
+    if (TrovichFog::Active()) {
+        maxFarClip = TrovichFog::MaxFarClip();
     }
 
     if (farClip < 550.0f / 3.0f) {
@@ -2900,6 +2906,7 @@ void CWorldScene::PushPortalView(CPortalView* portalView) {
 // VERIFY: 7852eb0b auto
 // OFFSET: 0x00795D40
 void CWorldScene::LocateViewer3() {
+    TrovichFog::SetViewerGroup(nullptr, 0xFFFF);  // TROVICH: outdoors unless a WMO group below says otherwise
     CWorldScene::s_viewerMapObjDef = nullptr;
     CWorldScene::s_viewerMovedMapObjDef = nullptr;
     CWorldScene::s_viewerMapObjGroups.m_count = 0;
@@ -2959,6 +2966,8 @@ void CWorldScene::LocateViewer3() {
         if (groups[1] != 0xFFFF) {
             groupFlags |= CWorldScene::s_viewerMapObjDef->m_owner->GetGroupFlags(groups[1]);
         }
+
+        TrovichFog::SetViewerGroup(defs[0], groups[0]);  // TROVICH: indoors (QueryOutdoors' rule) fades the volumetric fog out
 
         if (groupFlags & 0x40140) {
             CRect rect;

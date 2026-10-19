@@ -88,6 +88,7 @@
 #include <cfloat>
 #include <cmath>
 #include "WoW/Source/Ui/SpellBookFrame.h"
+#include "WoW/Source/WorldClient/TrovichFog.h"
 
 // STATIC: 0x009F9864
 static const uint32_t s_skinCursorModes[2] = { 21, 20 };
@@ -1751,6 +1752,7 @@ void CGWorldFrame::OnWorldRender() {
 
     GxuSortDrawList(GxuCat_0, GxuSort_VtxStream, *World::GetCamPos());
     GxuFlushDrawList(GxuCat_0, *World::GetCamPos());
+    TrovichFog::PrepareWater();  // TROVICH: volumetric fog - the depth of water and grass while they are queued
     CWorldScene::RenderDetailDoodads();
 
     if (World::SceneCamLiquidStatus(nullptr)) {
@@ -1762,6 +1764,7 @@ void CGWorldFrame::OnWorldRender() {
     } else {
         scene->Draw(M2PASS_2);
         CWorldScene::RenderLiquidPass();
+        TrovichFog::Composite();  // TROVICH: volumetric fog over the opaque world and the water, under weather / transparency
         CWorldScene::RenderWeather();
         CWorldScene::RenderBarriers(this->m_elapsedSec);
         scene->Draw(M2PASS_1);

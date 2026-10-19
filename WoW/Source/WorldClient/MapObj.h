@@ -59,6 +59,7 @@ typedef void (*RENDER_CALLBACK)(uint32_t, void*);
 class CMapObj : public CMapObjIndex, public TSHashObject<CMapObj, HASHKEY_NONE> {
     public:
     static void RenderMapObjGroupsShadowMap(void* groups, uint32_t count, void* groupData, const C44Matrix& translation, CFrustum& frustum);
+    static float s_shadowAlphaRef;  // TROVICH: alpha test of alpha-keyed materials (stock 0.878; the fog's camera pass lowers it)
     bool QueryLighting(uint32_t groupNum, const C3Vector& point, uint16_t face, CImVector* color, uint8_t* flag);
     bool QueryLighting(uint32_t groupNum, const C3Segment& seg, CImVector* color, uint8_t* flag);
     static TSList<CMapObj, TSGetExplicitLink<CMapObj> > s_asyncLoadQueue;

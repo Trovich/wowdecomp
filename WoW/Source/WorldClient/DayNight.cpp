@@ -32,6 +32,7 @@
 #include "WoW/Source/WorldClient/WorldParam.h"
 #include "Engine/Source/Gxu/Gxu.h"
 #include "WoW/Source/Ui/WorldFrame.h"
+#include "WoW/Source/WorldClient/TrovichFog.h"
 
 // STATIC: 0x00AF4C20
 static C2Vector s_starFadeTable[4] = { C2Vector(0.125f, 1.0f), C2Vector(0.1875f, 0.0f), C2Vector(0.9375f, 0.0f), C2Vector(1.0f, 1.0f) };
@@ -59,6 +60,62 @@ int32_t DayNight::s_mapId;
 
 // STATIC: 0x00D38AC8
 static CVar* s_cvSkyCloudLOD;
+
+// TROVICH: sun / moon on a real arc (east - south - west), the world light and the shadows follow them
+static CVar* s_cvSunPath;
+static CVar* s_cvSunLatitude;
+
+static int32_t TrovichSunPathOn() {
+    return s_cvSunPath && s_cvSunPath->m_intValue;
+}
+
+// Hour angle of the sun (radians, 0 = transit in the south) for a day progression t (0 = midnight).
+// Rise / transit / set at the stock sky's times - the sun crosses the horizon about 6:10 and 20:30 there
+// (SetPlanets' s_sunTheta), which the LightIntBand colours are made for - piecewise linear between them.
+static float TrovichHourAngle(float t) {
+    const float rise = 0.2569444f;   // 6:10
+    const float noon = 0.5f;         // 12:00
+    const float set = 0.8541667f;    // 20:30
+    const float pi = 3.14159265f;
+
+    if (t < rise) {
+        t += 1.0f;
+    }
+
+    if (t < noon) {
+        return -0.5f * pi + 0.5f * pi * (t - rise) / (noon - rise);
+    }
+
+    if (t < set) {
+        return 0.5f * pi * (t - noon) / (set - noon);
+    }
+
+    return 0.5f * pi + pi * (t - set) / (rise + 1.0f - set);   // night: set .. midnight (pi) .. rise
+}
+
+// Unit vector from the viewer to the sun (WoW axes: +x north, +y west, +z up), equinox declination 0 at the
+// latitude of the sunLatitude cvar: rises in the east (-y), culminates in the south (-x) at 90 - latitude,
+// sets in the west (+y). The moon is drawn opposite (full moon): -sun.
+static C3Vector TrovichSunVector(float t) {
+    float latitude = (s_cvSunLatitude ? s_cvSunLatitude->m_floatValue : 30.0f) * 0.017453292f;
+    float h = TrovichHourAngle(t);
+    float cosH = cosf(h);
+    return C3Vector(-sinf(latitude) * cosH, sinf(h), cosf(latitude) * cosH);
+}
+
+// A sky body placed on the sky sphere around the camera, held no lower than 12 degrees under the horizon
+// (stock keeps sun and moon 10 degrees under it at night, never deeper)
+static C3Vector TrovichSkyPosition(C3Vector dir, const C3Vector& camera) {
+    const float minZ = -0.2079117f;  // sin(-12 deg)
+
+    if (dir.z < minZ) {
+        float horizontal = sqrtf(dir.x * dir.x + dir.y * dir.y);
+        float k = horizontal > 0.0001f ? 0.9781476f / horizontal : 0.0f;
+        dir = C3Vector(dir.x * k, dir.y * k, minZ);
+    }
+
+    return C3Vector(camera.x + dir.x * 12.0f, camera.y + dir.y * 12.0f, camera.z + dir.z * 12.0f);
+}
 
 // STATIC: 0x00D38ADC
 int32_t DayNight::g_forceFullUpdate;
@@ -1163,9 +1220,60 @@ static void ApplyFogEclipse(DNFogInfo* fog) {
     fog->m_color.b = static_cast<uint8_t>((fog->m_color.b * scale + 255) >> 8);
 }
 
+// TROVICH
+bool DayNight::TrovichLightBody(C3Vector& toward, bool* moon) {
+    if (!TrovichSunPathOn()) {
+        return false;
+    }
+
+    toward = TrovichSunVector(DayNight::g_dnInfo.m_dayProgression);
+
+    if (moon) {
+        *moon = toward.z < 0.0f;
+    }
+
+    if (toward.z < 0.0f) {
+        toward = C3Vector(-toward.x, -toward.y, -toward.z);   // the moon
+    }
+
+    return true;
+}
+
 // VERIFY: 2bd27675 manual
 // OFFSET: 0x007EEA90
 void DayNight::SetDirection() {
+    // TROVICH: the light comes from whichever of sun / moon is up. Its elevation for lighting and shadows is
+    // held at 15 degrees or more (long, but not endless shadows), and over the last 5 degrees above the horizon
+    // it turns to straight down: at sunset / sunrise the light and the shadows shrink under the objects and grow
+    // again on the other side, instead of jumping from west to east when the moon takes over.
+    if (TrovichSunPathOn()) {
+        C3Vector body = TrovichSunVector(DayNight::g_dnInfo.m_dayProgression);
+
+        if (body.z < 0.0f) {
+            body = C3Vector(-body.x, -body.y, -body.z);   // the moon
+        }
+
+        float altitude = asinf(body.z > 1.0f ? 1.0f : body.z) * 57.29578f;
+        float elevation = altitude;
+
+        if (altitude < 5.0f) {
+            elevation = 15.0f + 75.0f * (1.0f - altitude / 5.0f);
+        } else if (altitude < 15.0f) {
+            elevation = 15.0f;
+        }
+
+        float horizontal = sqrtf(body.x * body.x + body.y * body.y);
+        float hx = horizontal > 0.0001f ? body.x / horizontal : 1.0f;
+        float hy = horizontal > 0.0001f ? body.y / horizontal : 0.0f;
+        float e = elevation * 0.017453292f;
+
+        // m_dir is the direction the light travels (stock z < 0): from the body down to the ground
+        DayNight::g_dnInfo.m_light1.m_dir.x = -hx * cosf(e);
+        DayNight::g_dnInfo.m_light1.m_dir.y = -hy * cosf(e);
+        DayNight::g_dnInfo.m_light1.m_dir.z = -sinf(e);
+        return;
+    }
+
     static C2Vector s_elevationTable[4] = { C2Vector(0.0f, 2.2165682f), C2Vector(0.25f, 1.9198623f), C2Vector(0.5f, 2.2165682f), C2Vector(0.75f, 1.9198623f) };
     static C2Vector s_azimuthTable[4] = { C2Vector(0.0f, 3.926991f), C2Vector(0.25f, 3.926991f), C2Vector(0.5f, 3.926991f), C2Vector(0.75f, 3.926991f) };
 
@@ -1227,6 +1335,15 @@ void DayNight::SetPlanets() {
     DayNight::g_moonGlare.m_scaleMin = planets.m_moon.m_scale;
     DayNight::g_moonGlare.m_position = planets.m_moon.m_position;
     DayNight::g_moonGlare.m_scaleMax = planets.m_moon.m_scale;
+
+    // TROVICH: sun and moon on the arc of TrovichSunVector (scales from the stock tables)
+    if (TrovichSunPathOn()) {
+        C3Vector sun = TrovichSunVector(info.m_dayProgression);
+        planets.m_sun.m_position = TrovichSkyPosition(sun, info.m_cameraPos);
+        planets.m_moon.m_position = TrovichSkyPosition(C3Vector(-sun.x, -sun.y, -sun.z), info.m_cameraPos);
+        DayNight::g_sunGlare.m_position = planets.m_sun.m_position;
+        DayNight::g_moonGlare.m_position = planets.m_moon.m_position;
+    }
 
     int32_t day = CMath::fint_(info.m_day * 65536.0f - 0.5f);
     int32_t progression = CMath::fint_(info.m_dayProgression * 65536.0f - 0.5f);
@@ -2140,6 +2257,12 @@ void DayNight::UpdateFog() {
         info.m_fog.m_density = info.m_bands.m_fogRate;
     }
 
+    // TROVICH: volumetric fog on - the stock outdoor fog becomes the far haze beyond its range (same colour);
+    // WMO interiors and water still override it below
+    if (TrovichFog::Active()) {
+        TrovichFog::OverrideOutdoorFog(info.m_fog.m_start, info.m_fog.m_end, info.m_fog.m_density);
+    }
+
     SMOFog fog;
     CMapObjDef* mapObjDef;
     uint8_t found;
@@ -2568,6 +2691,8 @@ void DayNight::LoadMap(int32_t mapId) {
     info.m_flashBlend = 0;
     DayNight::s_lightFlags = 0;
     s_cvSkyCloudLOD = CVar::Register("SkyCloudLOD", nullptr, 0, "0", CWorldParam::CloudLODCallback, 1, false, nullptr, false);
+    s_cvSunPath = CVar::Register("sunPath", "sun / moon on a real east-south-west arc, light and shadows follow them (Trovich)", 0, "1", nullptr, CATEGORY_GRAPHICS, false, nullptr, false);  // TROVICH
+    s_cvSunLatitude = CVar::Register("sunLatitude", "latitude for sunPath: noon sun at 90 - this (Trovich)", 0, "30", nullptr, CATEGORY_GRAPHICS, false, nullptr, false);  // TROVICH
     ConsoleCommandRegister("SkySunGlare", SkySunGlare, CATEGORY_GRAPHICS, "0, 1");
     DayNight::g_forceFullUpdate = 1;
 }

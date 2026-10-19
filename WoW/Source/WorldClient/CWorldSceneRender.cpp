@@ -24,6 +24,7 @@
 #include "WoW/Source/WorldClient/MapRenderChunk.h"
 #include "WoW/Source/WorldClient/MapWeather.h"
 #include "WoW/Source/WorldClient/ShadowQuery.h"
+#include "WoW/Source/WorldClient/TrovichFog.h"
 #include "WoW/Source/WorldClient/SortTable.h"
 #include "Engine/Source/Gx/CGxMatrixStack.h"
 #include "Engine/Source/ShaderEffect/ShadowCache.h"
@@ -192,6 +193,7 @@ void CWorldScene::Render(const C3Vector& cameraPos, float time) {
 
     CGUnit_C::UpdateMissileTrajectoryTargeting();
     CShadowQuery::Update();
+    TrovichFog::RenderDepth();  // TROVICH: volumetric fog camera depth pass
     CShaderEffect::UpdateProjMatrix();
     CWorldScene::ApplyFogState();
     CWorldScene::RenderChunks();

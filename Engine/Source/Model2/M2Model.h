@@ -229,6 +229,8 @@ class CM2Model {
 
     static int32_t __stdcall SequenceCallback(void* callback, CM2Model* model, uint32_t boneId, uint32_t sequenceId, int32_t interrupted, uint32_t time, uint32_t sequenceIndex, uint32_t startTime, uint64_t param);
     static void RenderModelBatchesShadowMap(const CModelBatchList& untextured, const CModelBatchList& textured);
+    static float s_shadowAlphaRef;  // TROVICH: alpha test of the textured batches (stock 0.502; the fog's camera pass lowers it)
+    static int32_t s_cameraDepthPass;  // TROVICH: the fog's camera depth pass gathers: full Animate, alpha-blended batches too
     static void RenderModelBatchListShadowMap(int32_t untextured, const CModelBatchList& list);
     static void TransformVertices_cpp(CM2Model* model, M2SkinSection* section, uint8_t* vertices, int32_t texCoord);
     static void TransformVertices_sse(CM2Model* model, M2SkinSection* section, uint8_t* vertices, int32_t texCoord);
@@ -338,6 +340,7 @@ class CM2Model {
     void SetAnimating(int32_t animating);
     void SetEventCallback(void* callback, uint64_t param);
     void SetLightEnabled(uint32_t index, uint32_t enabled);
+    void SetAllLightsEnabled(uint32_t enabled);  // TROVICH
     void SetLoadedCallback(void (*callback)(CM2Model*, void*), void* arg);
     void SetRibbonsEnabled(uint32_t enabled);
     void SetSequenceCallback(void* callback, uint64_t param);

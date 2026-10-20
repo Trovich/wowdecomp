@@ -21490,7 +21490,10 @@ void CGUnit_C::PostShutdown() {
 // VERIFY: dc577adb manual
 // OFFSET: 0x00723A50
 void CGUnit_C::FootstepAnimEventHit(const C3Vector* position, int32_t left) {
-    if (this->m_unit->m_unitFieldPetnumber || (this->m_movement->m_flags & 0x40000000) || (this->m_unit->m_unitFieldBytes1[2] & 0x2) || this->GetTransportGUID()) {
+    // TROVICH: no "m_unitFieldPetnumber ||" here - stock skipped footprints, footstep dust / splashes and
+    // footstep shakes for every unit with a pet number (hunter / warlock pets, the summoned ghoul...), while
+    // companions (no pet number) left prints. Stock exe: the jne at 0x00723A6B (0F 85 B5 03 00 00).
+    if ((this->m_movement->m_flags & 0x40000000) || (this->m_unit->m_unitFieldBytes1[2] & 0x2) || this->GetTransportGUID()) {
         return;
     }
 

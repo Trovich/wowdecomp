@@ -192,7 +192,10 @@ void CWorldScene::Render(const C3Vector& cameraPos, float time) {
     }
 
     CGUnit_C::UpdateMissileTrajectoryTargeting();
+    TrovichFog::ProfileFrame();                       // TROVICH: volumetricFogStats
+    TrovichFog::ProfileBegin(TrovichFog::PROF_SHADOWS);
     CShadowQuery::Update();
+    TrovichFog::ProfileEnd(TrovichFog::PROF_SHADOWS);
     TrovichFog::RenderDepth();  // TROVICH: volumetric fog camera depth pass
     CShaderEffect::UpdateProjMatrix();
     CWorldScene::ApplyFogState();

@@ -4368,6 +4368,7 @@ static FrameScript_Method s_SystemFunctions[] = {
     { "ConsoleExec", &Script_ConsoleExec },
     { "TrovichFogPosition", &TrovichFog::ScriptPosition },  // TROVICH: volumetric fog banks
     { "TrovichFogLight", &TrovichFog::ScriptLight },        // TROVICH
+    { "TrovichFogStats", &TrovichFog::ScriptStats },        // TROVICH
     { "ReadFile", &Script_ReadFile },
     { "DeleteFile", &Script_DeleteFile },
     { "AppendToFile", &Script_AppendToFile },

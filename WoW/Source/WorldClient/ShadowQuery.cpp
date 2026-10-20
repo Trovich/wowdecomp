@@ -61,6 +61,7 @@ static int32_t s_viewGroupsOnly;
 // band (within s_viewNearRange of s_viewCamera) already took
 static float s_viewMinRadius;
 static float s_viewNearRange;
+static float s_viewFarRange;      // ... and none beyond this (volumetricFogTreeRange)
 static C3Vector s_viewCamera;
 
 // VERIFY: a0192ad6 auto
@@ -74,6 +75,7 @@ void CShadowQuery::Initialize() {
     g_shadowCull = CVar::Register("shadowCull", "enable shadow frustum culling", 0, "1", nullptr, CATEGORY_DEFAULT, false, nullptr, false);
     g_shadowScissor = CVar::Register("shadowScissor", "enable scissoring when rendering shadowmaps", 0, "1", nullptr, CATEGORY_DEFAULT, false, nullptr, false);
     g_shadowInstancing = CVar::Register("shadowInstancing", "enable instancing when rendering shadowmaps", 0, "1", nullptr, CATEGORY_DEFAULT, false, nullptr, false);
+    g_shadowStagger = CVar::Register("shadowStagger", "VERY_HIGH shadows: the middle band rendered every 2nd frame, the far one every 4th (Trovich)", 0, "1", nullptr, CATEGORY_DEFAULT, false, nullptr, false);  // TROVICH
     g_shadowTerrain = CVar::Register("shadowTerrain", "terrain casts dynamic shadows (Trovich)", 0, "1", nullptr, CATEGORY_DEFAULT, false, nullptr, false);  // TROVICH
 
     CShadowCache::Initialize();
@@ -140,6 +142,7 @@ void CShadowQuery::Update() {
     direction.y = direction.y * inv;
     direction.z = z * inv;
     CShadowCache::PreUpdate(direction);
+    CShadowCache::s_staggerBands = g_shadowStagger && g_shadowStagger->m_intValue;  // TROVICH
     C3Vector viewer(0.0f, 0.0f, 0.0f);
     GetViewerPosition(&viewer);
     CShadowCache::SetDebugParams(1.0f, 0);
@@ -163,9 +166,20 @@ void CShadowQuery::MatrixCallback(C3Vector& center, float radius, C44Matrix& mat
     C3Vector camera(0.0f, 0.0f, 0.0f);
     CGWorldFrame::GetCameraPosition(&camera);
 
-    eye.x = center.x - CShadowCache::s_sunDir.x * 2000.0f - camera.x;
-    eye.y = center.y - CShadowCache::s_sunDir.y * 2000.0f - camera.y;
-    eye.z = center.z - 2000.0f * CShadowCache::s_sunDir.z - camera.z;
+    // TROVICH: a band's matrix with the sun direction it was rendered with (staggered bands are a few frames old)
+    C3Vector sun = CShadowCache::s_sunDir;
+
+    if (band >= 0 && band < 3) {
+        const C3Vector& own = CShadowCache::s_bandSunDir[band];
+
+        if (own.x * own.x + own.y * own.y + own.z * own.z > 0.5f) {
+            sun = own;
+        }
+    }
+
+    eye.x = center.x - sun.x * 2000.0f - camera.x;
+    eye.y = center.y - sun.y * 2000.0f - camera.y;
+    eye.z = center.z - 2000.0f * sun.z - camera.z;
     target.x = center.x - camera.x;
     target.y = center.y - camera.y;
     target.z = center.z - camera.z;
@@ -887,6 +901,12 @@ void CShadowQuery::QueryTerrainBand(CShadowCacheQueryData& data, int32_t band) {
                     if (nearEdge > 0.0f && d.x * d.x + d.y * d.y + d.z * d.z < nearEdge * nearEdge) {
                         continue;
                     }
+
+                    float farEdge = s_viewFarRange + doodad->m_sphere.r;
+
+                    if (d.x * d.x + d.y * d.y + d.z * d.z > farEdge * farEdge) {
+                        continue;
+                    }
                 }
 
                 int32_t wanted = model->GetBillboardBoneCount() ? (data.m_queryFlags[band] & 0x4) : (data.m_queryFlags[band] & 0x8);
@@ -1251,7 +1271,7 @@ static void SetPlane(C4Plane& plane, C3Vector n, const C3Vector& point) {
 // ShadowMapRenderSL effect from the CAMERA: its pixel shader writes view z * c0.w = view depth / range (the
 // camera's view z points forward, GxuXformCreateLookAtSgCompat). Cleared to 1 = nothing nearer than the range.
 // Runs after CShadowQuery::Update: the shadow bands are drawn, their buffers are free, the models animated.
-void CShadowQuery::RenderViewDepth(CGxTex* target, float depthRange, float modelRange) {
+void CShadowQuery::RenderViewDepth(CGxTex* target, float depthRange, float modelRange, float treeRange) {
     float range = modelRange;
     // the camera: the device view is its camera-relative rotation (see RenderCallback), the position the world view
     C44Matrix view;
@@ -1358,6 +1378,7 @@ void CShadowQuery::RenderViewDepth(CGxTex* target, float depthRange, float model
     CShadowQuery::QueryTerrainBand(data, 0);         // the chunks' doodads, band 0
     s_viewMinRadius = 6.0f;                          // ... and the big ones (trees, rocks) out to depthRange, band 2
     s_viewNearRange = modelRange;
+    s_viewFarRange = treeRange;
     s_viewCamera = camera;
     CShadowQuery::QueryTerrainBand(data, 2);
     s_viewMinRadius = 0.0f;

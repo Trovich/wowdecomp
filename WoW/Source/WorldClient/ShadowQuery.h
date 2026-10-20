@@ -11,6 +11,7 @@ extern CVar* g_shadowCull;
 extern CVar* g_shadowScissor;
 extern CVar* g_shadowInstancing;
 extern CVar* g_shadowTerrain;  // TROVICH
+extern CVar* g_shadowStagger;  // TROVICH
 
 struct ShadowQueryBuffers {
     /* 0000 */ uint32_t m_groupCount;
@@ -49,7 +50,7 @@ class CShadowQuery {
     // TROVICH: camera depth pass for the volumetric fog (TrovichFog.cpp): linear view depth / range into target
     static void QueryTerrainView(CShadowCacheQueryData& data, int32_t band);
     // models within modelRange, terrain and WMO groups (interiors too) within depthRange, depth / depthRange
-    static void RenderViewDepth(CGxTex* target, float depthRange, float modelRange);
+    static void RenderViewDepth(CGxTex* target, float depthRange, float modelRange, float treeRange);
 };
 
 #endif

@@ -52,6 +52,14 @@ namespace TrovichFog {
     //       world light's brightness 0..1 here and now (DayNight: zone, time, weather), indoors 1 / 0
     int32_t ScriptPosition(lua_State* L);
     int32_t ScriptLight(lua_State* L);
+
+    // volumetricFogStats 1: CPU and GPU (D3D9 timestamp queries) time of each part, averaged over 2 seconds.
+    //   TrovichFogStats() -> the latest summary line, once (nil until the next one)
+    enum ProfileSection { PROF_SHADOWS, PROF_DEPTH, PROF_WATER, PROF_GRASS, PROF_FOG, PROF_LAMPS, PROF_COUNT };
+    void ProfileFrame();                    // CWorldSceneRender, once a frame, before the shadow update
+    void ProfileBegin(ProfileSection section);
+    void ProfileEnd(ProfileSection section);
+    int32_t ScriptStats(lua_State* L);
 }
 
 #endif

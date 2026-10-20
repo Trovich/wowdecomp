@@ -80,6 +80,8 @@ class CShadowCache {
     static const char* s_shadowModeDescs[NUM_SHADOW_MODES + 1];
     static const uint32_t s_shadowValues[NUM_SHADOW_MODES + 1];
     static C3Vector s_sunDir;
+    static int32_t s_staggerBands;    // TROVICH: VERY_HIGH renders band 1 every 2nd, band 2 every 4th frame (cvar shadowStagger)
+    static C3Vector s_bandSunDir[3];  // TROVICH: the sun direction each band was last rendered with (its matrix needs it)
     static C4Vector s_sunDirViewSpace;
     static float s_textureSize[2];
 

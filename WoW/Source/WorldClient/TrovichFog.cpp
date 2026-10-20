@@ -67,6 +67,11 @@ static CVar* s_cvFogSeaNoise;
 static CVar* s_cvFogBanks;
 static CVar* s_cvFogAmbient;
 static CVar* s_cvFogNaturalLight;
+static CVar* s_cvFogFast;
+static CVar* s_cvFogStats;
+static CVar* s_cvFogTreeRange;
+static CVar* s_cvFogGrassRange;
+static CTexture* s_noiseTexture;     // NoiseTextureCallback, s5 of the fog shaders
 
 // fog banks, parsed from volumetricFogBanks when it changes
 #define FOG_BANKS 8
@@ -145,11 +150,302 @@ static void LogOnChange(int32_t slot, const char* text) {
     }
 }
 
+// the D3D9 device behind Gx (nullptr on other APIs)
+static IDirect3DDevice9* D3DDevice() {
+    if (g_theGxDevicePtr->m_api == GxApi_D3d9) {
+        return static_cast<CGxDeviceD3d*>(g_theGxDevicePtr)->m_d3dDevice;
+    }
+
+    if (g_theGxDevicePtr->m_api == GxApi_D3d9Ex) {
+        return static_cast<CGxDeviceD3d9Ex*>(g_theGxDevicePtr)->m_d3dDevice;
+    }
+
+    return nullptr;
+}
+
+// ---- volumetricFogStats ------------------------------------------------------------------------------------------
+// CPU: QueryPerformanceCounter around each part (the time to issue it). GPU: a timestamp before and after each part,
+// inside a TIMESTAMPDISJOINT frame, read back 4 frames later (no stall; a frame not ready is skipped).
+#define PROF_FRAMES 4
+struct ProfileGpuFrame {
+    IDirect3DQuery9* disjoint;
+    IDirect3DQuery9* frequency;
+    IDirect3DQuery9* stamps[2 * TrovichFog::PROF_COUNT];
+    int32_t issued[2 * TrovichFog::PROF_COUNT];
+    int32_t open;     // begun, not yet ended
+    int32_t pending;  // ended, results not read
+};
+
+static ProfileGpuFrame s_gpuFrames[PROF_FRAMES];
+static uint32_t s_gpuFrame;
+static int32_t s_gpuReady;          // the queries exist
+static LARGE_INTEGER s_cpuBegin[TrovichFog::PROF_COUNT];
+static double s_cpuSum[TrovichFog::PROF_COUNT];
+static double s_gpuSum[TrovichFog::PROF_COUNT];
+static uint32_t s_gpuCount[TrovichFog::PROF_COUNT];
+static uint32_t s_profFrames;
+static LARGE_INTEGER s_profWindowStart;
+static LARGE_INTEGER s_profLastFrame;
+static double s_frameSum;
+static double s_countSum[5];         // depth pass: model batches, far tree batches, WMO groups, terrain chunks; grass
+static char s_statsText[512];
+static int32_t s_statsNew;
+
+static int32_t Profiling() {
+    return s_cvFogStats && s_cvFogStats->m_intValue;
+}
+
+static void ProfileRelease() {
+    for (uint32_t f = 0; f < PROF_FRAMES; f++) {
+        ProfileGpuFrame& frame = s_gpuFrames[f];
+
+        if (frame.disjoint) frame.disjoint->Release();
+        if (frame.frequency) frame.frequency->Release();
+
+        for (uint32_t i = 0; i < 2 * TrovichFog::PROF_COUNT; i++) {
+            if (frame.stamps[i]) frame.stamps[i]->Release();
+        }
+
+        memset(&frame, 0, sizeof(frame));
+    }
+
+    s_gpuReady = 0;
+}
+
+static void ProfileCreate() {
+    IDirect3DDevice9* device = D3DDevice();
+
+    if (s_gpuReady || !device) {
+        return;
+    }
+
+    bool ok = true;
+
+    for (uint32_t f = 0; f < PROF_FRAMES && ok; f++) {
+        ProfileGpuFrame& frame = s_gpuFrames[f];
+        ok = SUCCEEDED(device->CreateQuery(D3DQUERYTYPE_TIMESTAMPDISJOINT, &frame.disjoint)) && SUCCEEDED(device->CreateQuery(D3DQUERYTYPE_TIMESTAMPFREQ, &frame.frequency));
+
+        for (uint32_t i = 0; i < 2 * TrovichFog::PROF_COUNT && ok; i++) {
+            ok = SUCCEEDED(device->CreateQuery(D3DQUERYTYPE_TIMESTAMP, &frame.stamps[i]));
+        }
+    }
+
+    if (!ok) {
+        ProfileRelease();
+        Log("stats: the device has no timestamp queries - CPU times only");
+        s_gpuReady = -1;   // do not retry
+        return;
+    }
+
+    s_gpuReady = 1;
+}
+
+// the results of a frame issued PROF_FRAMES ago, if the GPU has them
+static void ProfileCollect(ProfileGpuFrame& frame) {
+    if (!frame.pending) {
+        return;
+    }
+
+    frame.pending = 0;
+    BOOL disjoint = TRUE;
+    UINT64 frequency = 0;
+
+    if (frame.disjoint->GetData(&disjoint, sizeof(disjoint), 0) != S_OK || disjoint || frame.frequency->GetData(&frequency, sizeof(frequency), 0) != S_OK || !frequency) {
+        return;
+    }
+
+    for (uint32_t s = 0; s < TrovichFog::PROF_COUNT; s++) {
+        UINT64 begin = 0;
+        UINT64 end = 0;
+
+        if (frame.issued[2 * s] && frame.issued[2 * s + 1]
+            && frame.stamps[2 * s]->GetData(&begin, sizeof(begin), 0) == S_OK && frame.stamps[2 * s + 1]->GetData(&end, sizeof(end), 0) == S_OK && end >= begin) {
+            s_gpuSum[s] += static_cast<double>(end - begin) * 1000.0 / static_cast<double>(frequency);
+            s_gpuCount[s]++;
+        }
+    }
+}
+
+static void ProfileReport(double seconds) {
+    LARGE_INTEGER frequency;
+    QueryPerformanceFrequency(&frequency);
+    double frames = s_profFrames ? s_profFrames : 1;
+    double gpu[TrovichFog::PROF_COUNT];
+
+    for (uint32_t i = 0; i < TrovichFog::PROF_COUNT; i++) {
+        gpu[i] = s_gpuCount[i] ? s_gpuSum[i] / s_gpuCount[i] : -1.0;
+    }
+
+    double frameMs = s_frameSum / frames;
+    snprintf(s_statsText, sizeof(s_statsText),
+        "%.0f fps (%.2f ms) | GPU ms: shadows %.2f, depth %.2f, water %.2f (grass %.2f), fog %.2f, lamps %.2f | CPU ms: shadows %.2f, depth %.2f, water %.2f (grass %.2f), fog %.2f | depth pass: %.0f + %.0f far batches, %.0f WMO groups, %.0f chunks, %.0f grass | fast %d",
+        frameMs > 0.0 ? 1000.0 / frameMs : 0.0, frameMs,
+        gpu[TrovichFog::PROF_SHADOWS], gpu[TrovichFog::PROF_DEPTH], gpu[TrovichFog::PROF_WATER], gpu[TrovichFog::PROF_GRASS], gpu[TrovichFog::PROF_FOG], gpu[TrovichFog::PROF_LAMPS],
+        s_cpuSum[TrovichFog::PROF_SHADOWS] / frames, s_cpuSum[TrovichFog::PROF_DEPTH] / frames, s_cpuSum[TrovichFog::PROF_WATER] / frames, s_cpuSum[TrovichFog::PROF_GRASS] / frames, s_cpuSum[TrovichFog::PROF_FOG] / frames,
+        s_countSum[0] / frames, s_countSum[1] / frames, s_countSum[2] / frames, s_countSum[3] / frames, s_countSum[4] / frames,
+        s_cvFogFast ? s_cvFogFast->m_intValue : 0);
+    s_statsNew = 1;
+    Log("stats %.1f s: %s", seconds, s_statsText);
+    (void)frequency;
+
+    memset(s_cpuSum, 0, sizeof(s_cpuSum));
+    memset(s_gpuSum, 0, sizeof(s_gpuSum));
+    memset(s_gpuCount, 0, sizeof(s_gpuCount));
+    memset(s_countSum, 0, sizeof(s_countSum));
+    s_frameSum = 0.0;
+    s_profFrames = 0;
+}
+
+void TrovichFog::ProfileFrame() {
+    if (!Profiling()) {
+        if (s_gpuReady == 1) {
+            ProfileRelease();
+        }
+
+        s_profLastFrame.QuadPart = 0;
+        return;
+    }
+
+    LARGE_INTEGER now;
+    LARGE_INTEGER frequency;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&frequency);
+
+    if (s_profLastFrame.QuadPart) {
+        s_frameSum += static_cast<double>(now.QuadPart - s_profLastFrame.QuadPart) * 1000.0 / static_cast<double>(frequency.QuadPart);
+        s_profFrames++;
+    } else {
+        s_profWindowStart = now;
+    }
+
+    s_profLastFrame = now;
+    double seconds = static_cast<double>(now.QuadPart - s_profWindowStart.QuadPart) / static_cast<double>(frequency.QuadPart);
+
+    if (seconds >= 2.0 && s_profFrames) {
+        ProfileReport(seconds);
+        s_profWindowStart = now;
+    }
+
+    if (!s_gpuReady) {
+        ProfileCreate();
+    }
+
+    if (s_gpuReady != 1) {
+        return;
+    }
+
+    // close the last frame, read the oldest, open this one
+    ProfileGpuFrame& last = s_gpuFrames[s_gpuFrame % PROF_FRAMES];
+
+    if (last.open) {
+        last.frequency->Issue(D3DISSUE_END);
+        last.disjoint->Issue(D3DISSUE_END);
+        last.open = 0;
+        last.pending = 1;
+    }
+
+    s_gpuFrame++;
+    ProfileGpuFrame& frame = s_gpuFrames[s_gpuFrame % PROF_FRAMES];
+    ProfileCollect(frame);
+    memset(frame.issued, 0, sizeof(frame.issued));
+    frame.disjoint->Issue(D3DISSUE_BEGIN);
+    frame.open = 1;
+}
+
+static void ProfileStamp(TrovichFog::ProfileSection section, int32_t end) {
+    if (!Profiling()) {
+        return;
+    }
+
+    if (end) {
+        LARGE_INTEGER now;
+        LARGE_INTEGER frequency;
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&frequency);
+        s_cpuSum[section] += static_cast<double>(now.QuadPart - s_cpuBegin[section].QuadPart) * 1000.0 / static_cast<double>(frequency.QuadPart);
+    } else {
+        QueryPerformanceCounter(&s_cpuBegin[section]);
+    }
+
+    ProfileGpuFrame& frame = s_gpuFrames[s_gpuFrame % PROF_FRAMES];
+
+    if (s_gpuReady == 1 && frame.open) {
+        frame.stamps[2 * section + end]->Issue(D3DISSUE_END);
+        frame.issued[2 * section + end] = 1;
+    }
+}
+
+void TrovichFog::ProfileBegin(ProfileSection section) {
+    ProfileStamp(section, 0);
+}
+
+void TrovichFog::ProfileEnd(ProfileSection section) {
+    ProfileStamp(section, 1);
+}
+
+int32_t TrovichFog::ScriptStats(lua_State* L) {
+    if (!s_statsNew) {
+        return 0;
+    }
+
+    s_statsNew = 0;
+    lua_pushstring(L, s_statsText);
+    return 1;
+}
+
+// 256 x 256 value-noise lattice for NoiseFast: r random, g = r at (+37, +17) (the next z slice)
+static void NoiseTextureCallback(EGxTexCommand command, uint32_t width, uint32_t height, uint32_t depth, uint32_t mipLevel, void* userArg, uint32_t& texelStrideInBytes, const void*& texels) {
+    static uint32_t s_texels[256 * 256];
+    static int32_t s_filled;
+
+    if (command != GxTex_Latch) {
+        return;
+    }
+
+    if (!s_filled) {
+        static uint8_t values[256 * 256];
+        uint32_t seed = 0x9E3779B9u;
+
+        for (uint32_t i = 0; i < 256 * 256; i++) {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            values[i] = static_cast<uint8_t>(seed >> 24);
+        }
+
+        for (uint32_t y = 0; y < 256; y++) {
+            for (uint32_t x = 0; x < 256; x++) {
+                uint32_t r = values[y * 256 + x];
+                uint32_t g = values[((y + 17) & 255) * 256 + ((x + 37) & 255)];
+                s_texels[y * 256 + x] = 0xFF000000u | (r << 16) | (g << 8);   // A8R8G8B8: r in R, g in G
+            }
+        }
+
+        s_filled = 1;
+    }
+
+    texelStrideInBytes = 256 * 4;
+    texels = s_texels;
+}
+
+static CGxTex* NoiseTexture() {
+    static CGxTex* s_gxNoise;
+
+    if (!s_gxNoise) {
+        CGxTexFlags flags(GxTex_Linear, 1, 1, 0, 0, 0, 1, 0, 0, 0);
+        GxTexCreate(256, 256, GxTex_Argb8888, flags, nullptr, NoiseTextureCallback, s_gxNoise);
+    }
+
+    return s_gxNoise;
+}
+
 static void DepthTextureCallback(EGxTexCommand command, uint32_t width, uint32_t height, uint32_t depth, uint32_t mipLevel, void* userArg, uint32_t& texelStrideInBytes, const void*& texels) {
 }
 
 static void __fastcall DepthTexturesLost() {
     s_recreate = 1;
+    ProfileRelease();   // the queries go with the device
+    s_gpuReady = 0;
 }
 
 static int32_t FogMode() {
@@ -237,6 +533,10 @@ void TrovichFog::Initialize() {
     s_cvFogBanks = CVar::Register("volumetricFogBanks", "fog banks \"x y z radius height density noise; ...\" (at most 8), set by the addon (Trovich)", 0, "", nullptr, CATEGORY_GRAPHICS, false, nullptr, false);
     s_cvFogAmbient = CVar::Register("volumetricFogAmbient", "near fog lit by the world's ambient light (1) or the far-fog colour (0) (Trovich)", 0, "0.7", nullptr, CATEGORY_GRAPHICS, false, nullptr, false);
     s_cvFogNaturalLight = CVar::Register("volumetricFogNaturalLight", "fog light: 1 = the world's light with a softened sun glow, 0 = the classic fog colour and full glow (Trovich)", 0, "1", nullptr, CATEGORY_GRAPHICS, false, nullptr, false);
+    s_cvFogFast = CVar::Register("volumetricFogFast", "volumetric fog: 1 = the fast paths (noise texture, steps by distance, skipped shadow lookups, lamp pass cut to the halos), 0 = the old ones (Trovich)", 0, "1", nullptr, CATEGORY_GRAPHICS, false, nullptr, false);
+    s_cvFogStats = CVar::Register("volumetricFogStats", "volumetric fog timing: 1 = measure every part (CPU / GPU ms) and report every 2 s (Trovich)", 0, "0", nullptr, CATEGORY_GRAPHICS, false, nullptr, false);
+    s_cvFogTreeRange = CVar::Register("volumetricFogTreeRange", "yards to which the big doodads (trees, rocks) beyond the fog range go into its depth (Trovich)", 0, "1500", nullptr, CATEGORY_GRAPHICS, false, nullptr, false);
+    s_cvFogGrassRange = CVar::Register("volumetricFogGrassRange", "yards to which the grass goes into the fog's depth (Trovich)", 0, "60", nullptr, CATEGORY_GRAPHICS, false, nullptr, false);
     s_cvFogLampSize = CVar::Register("volumetricFogLampSize", "core radius of a lamp halo in yards: softer glow, no bright dot (Trovich)", 0, "3", nullptr, CATEGORY_GRAPHICS, false, nullptr, false);
     g_theGxDevicePtr->AddTextureRecreationCallback(DepthTexturesLost);
     Log("init: volumetricFog %s, volumetricFogRange %s", s_cvFog ? "registered" : "NOT registered", s_cvFogRange ? "registered" : "NOT registered");
@@ -371,8 +671,17 @@ void TrovichFog::RenderDepth() {
     s_depthRange = World::s_farClip > FogRange() ? World::s_farClip : FogRange();
     s_depthRange = s_depthRange > 3200.0f ? 3200.0f : s_depthRange;
 
-    CShadowQuery::RenderViewDepth(target, s_depthRange, FogRange());
+    TrovichFog::ProfileBegin(TrovichFog::PROF_DEPTH);
+    CShadowQuery::RenderViewDepth(target, s_depthRange, FogRange(), CVarFloat(s_cvFogTreeRange, 1500.0f, 0.0f, 5000.0f));
+    TrovichFog::ProfileEnd(TrovichFog::PROF_DEPTH);
     s_haveDepth = 1;
+
+    if (Profiling()) {
+        s_countSum[0] += CShadowQuery::s_bandBuffers[0].m_untextured.m_count + CShadowQuery::s_bandBuffers[0].m_textured.m_count;
+        s_countSum[1] += CShadowQuery::s_bandBuffers[2].m_untextured.m_count + CShadowQuery::s_bandBuffers[2].m_textured.m_count;
+        s_countSum[2] += CShadowQuery::s_bandBuffers[1].m_groupCount;
+        s_countSum[3] += CShadowQuery::TerrainCasterCount(1);
+    }
 
     // how much it drew, logged when the counts change by a lot (bucketed)
     ShadowQueryBuffers& buffers = CShadowQuery::s_bandBuffers[0];
@@ -409,6 +718,10 @@ static C3Vector ViewerPosition() {
     }
 
     return position;
+}
+
+static int32_t FastPaths() {
+    return !s_cvFogFast || s_cvFogFast->m_intValue;
 }
 
 // volumetricFogBanks -> s_banks (only when the text changed)
@@ -477,7 +790,7 @@ static void SetBankConstants() {
     int32_t natural = !s_cvFogNaturalLight || s_cvFogNaturalLight->m_intValue;
     float light[2][4] = {
         { ambient.r / 255.0f, ambient.g / 255.0f, ambient.b / 255.0f, natural ? CVarFloat(s_cvFogAmbient, 0.7f, 0.0f, 1.0f) : 0.0f },
-        { natural ? 0.4f : 0.0f, 0.0f, 0.0f, 0.0f },
+        { natural ? 0.4f : 0.0f, FastPaths() ? 1.0f : 0.0f, 0.0f, 0.0f },
     };
     g_theGxDevicePtr->ShaderConstantsSet(GxSh_Pixel, 64, &light[0][0], 2);
 }
@@ -605,21 +918,30 @@ static void SetFogConstants() {
     }
 }
 
-// a quad over the whole viewport: clip-space positions, texture coordinates with the D3D9 half-texel offset
-static void DrawScreenQuad() {
+// a quad over the viewport (or the part of it in rect: clip-space x / y, -1..1), texture coordinates with the D3D9
+// half-texel offset
+static void DrawScreenQuad(const CRect* rect = nullptr) {
     float du = 0.5f / static_cast<float>(s_depthWidth);
     float dv = 0.5f / static_cast<float>(s_depthHeight);
+    float x0 = rect ? rect->minX : -1.0f;
+    float y0 = rect ? rect->minY : -1.0f;
+    float x1 = rect ? rect->maxX : 1.0f;
+    float y1 = rect ? rect->maxY : 1.0f;
+    float u0 = x0 * 0.5f + 0.5f;
+    float u1 = x1 * 0.5f + 0.5f;
+    float v0 = 0.5f - y1 * 0.5f;   // top
+    float v1 = 0.5f - y0 * 0.5f;
 
     CGxBuf* vertexBuf = g_theGxDevicePtr->BufStream(GxPoolTarget_Vertex, sizeof(CGxVertexPT), 4);
     CGxVertexPT* v = reinterpret_cast<CGxVertexPT*>(g_theGxDevicePtr->BufLock(vertexBuf));
-    v[0].p = C3Vector(-1.0f, 1.0f, 0.0f);
-    v[0].tc = C2Vector(0.0f + du, 0.0f + dv);
-    v[1].p = C3Vector(1.0f, 1.0f, 0.0f);
-    v[1].tc = C2Vector(1.0f + du, 0.0f + dv);
-    v[2].p = C3Vector(-1.0f, -1.0f, 0.0f);
-    v[2].tc = C2Vector(0.0f + du, 1.0f + dv);
-    v[3].p = C3Vector(1.0f, -1.0f, 0.0f);
-    v[3].tc = C2Vector(1.0f + du, 1.0f + dv);
+    v[0].p = C3Vector(x0, y1, 0.0f);
+    v[0].tc = C2Vector(u0 + du, v0 + dv);
+    v[1].p = C3Vector(x1, y1, 0.0f);
+    v[1].tc = C2Vector(u1 + du, v0 + dv);
+    v[2].p = C3Vector(x0, y0, 0.0f);
+    v[2].tc = C2Vector(u0 + du, v1 + dv);
+    v[3].p = C3Vector(x1, y0, 0.0f);
+    v[3].tc = C2Vector(u1 + du, v1 + dv);
     g_theGxDevicePtr->BufUnlock(vertexBuf, 0);
     vertexBuf->m_hasData = 1;
     GxPrimVertexPtr(vertexBuf, GxVBF_PT);
@@ -656,6 +978,58 @@ struct LampPlace {
 };
 
 static LampPlace s_lampPlaces[256];
+static CRect s_lampRect;          // clip-space rectangle the selected lamps' halos can reach (SetLampConstants)
+static int32_t s_lampRectEmpty;
+
+// widen s_lampRect by a lamp's halo: the sphere of its reach, projected (conservatively, at its near side)
+static void AddLampToRect(const C3Vector& rel, float reach) {
+    float tanX = sqrtf(s_rayRight.x * s_rayRight.x + s_rayRight.y * s_rayRight.y + s_rayRight.z * s_rayRight.z);
+    float tanY = sqrtf(s_rayUp.x * s_rayUp.x + s_rayUp.y * s_rayUp.y + s_rayUp.z * s_rayUp.z);
+    float z = rel.x * s_rayForward.x + rel.y * s_rayForward.y + rel.z * s_rayForward.z;
+    float x = rel.x * s_axisRight.x + rel.y * s_axisRight.y + rel.z * s_axisRight.z;
+    float y = rel.x * s_axisUp.x + rel.y * s_axisUp.y + rel.z * s_axisUp.z;
+    float nearZ = z - reach;
+    CRect lamp;
+
+    if (nearZ < 1.0f || tanX <= 0.0f || tanY <= 0.0f) {
+        if (z + reach < 0.0f) {
+            return;   // wholly behind the camera
+        }
+
+        lamp.minX = -1.0f;
+        lamp.minY = -1.0f;
+        lamp.maxX = 1.0f;
+        lamp.maxY = 1.0f;
+    } else {
+        lamp.minX = (x - reach) / (nearZ * tanX);
+        lamp.maxX = (x + reach) / (nearZ * tanX);
+        lamp.minY = (y - reach) / (nearZ * tanY);
+        lamp.maxY = (y + reach) / (nearZ * tanY);
+    }
+
+    if (s_lampRectEmpty) {
+        s_lampRect = lamp;
+        s_lampRectEmpty = 0;
+    } else {
+        s_lampRect.minX = lamp.minX < s_lampRect.minX ? lamp.minX : s_lampRect.minX;
+        s_lampRect.minY = lamp.minY < s_lampRect.minY ? lamp.minY : s_lampRect.minY;
+        s_lampRect.maxX = lamp.maxX > s_lampRect.maxX ? lamp.maxX : s_lampRect.maxX;
+        s_lampRect.maxY = lamp.maxY > s_lampRect.maxY ? lamp.maxY : s_lampRect.maxY;
+    }
+}
+
+// false: no halo on screen
+static bool LampScreenRect(CRect& rect) {
+    if (s_lampRectEmpty) {
+        return false;
+    }
+
+    rect.minX = s_lampRect.minX < -1.0f ? -1.0f : s_lampRect.minX;
+    rect.minY = s_lampRect.minY < -1.0f ? -1.0f : s_lampRect.minY;
+    rect.maxX = s_lampRect.maxX > 1.0f ? 1.0f : s_lampRect.maxX;
+    rect.maxY = s_lampRect.maxY > 1.0f ? 1.0f : s_lampRect.maxY;
+    return rect.minX < rect.maxX && rect.minY < rect.maxY;
+}
 static uint32_t s_lampPlaceNext;
 
 static int32_t LampIndoor(CM2Light* light) {
@@ -710,6 +1084,7 @@ static uint32_t SetLampConstants() {
     const uint32_t maxLamps = 8;
     float constants[3 * maxLamps + 1][4] = {};
     uint32_t count = 0;
+    s_lampRectEmpty = 1;
 
     for (uint32_t i = 0; i < s_lamps.m_count && count < maxLamps; i++) {
         CM2Light* lamp = s_lamps.m_lights[i];
@@ -735,6 +1110,7 @@ static uint32_t SetLampConstants() {
         constants[2 * maxLamps + count][1] = lamp->m_linearAttenuation;
         constants[2 * maxLamps + count][2] = lamp->m_quadraticAttenuation;
         constants[2 * maxLamps + count][3] = core;
+        AddLampToRect(rel, 4.0f * M2LightReach(lamp) + core);   // the halo's tail falls as 1 / distance: wide margin
         count++;
     }
 
@@ -753,13 +1129,7 @@ static uint32_t SetLampConstants() {
 // No depth test: the fog shaders take min(scene, water), so terrain in front of the water still wins.
 // D3DRS_BLENDOP MIN / ADD on the D3D9 devices (Gx never touches it - ADD all along). False elsewhere.
 static bool SetBlendOpMin(bool min) {
-    IDirect3DDevice9* device = nullptr;
-
-    if (g_theGxDevicePtr->m_api == GxApi_D3d9) {
-        device = static_cast<CGxDeviceD3d*>(g_theGxDevicePtr)->m_d3dDevice;
-    } else if (g_theGxDevicePtr->m_api == GxApi_D3d9Ex) {
-        device = static_cast<CGxDeviceD3d9Ex*>(g_theGxDevicePtr)->m_d3dDevice;
-    }
+    IDirect3DDevice9* device = D3DDevice();
 
     if (!device) {
         return false;
@@ -799,13 +1169,27 @@ static void RenderGrassDepth() {
     CGxMatrixStack& stack = g_theGxDevicePtr->m_xforms[GxXform_View];
     view = stack.m_mtx[stack.m_level];
 
+    // the grass near enough to matter (a far blade is seen against the ground behind it anyway): a chunk at a time
+    float grassRange = CVarFloat(s_cvFogGrassRange, 60.0f, 0.0f, 1000.0f);
+
     for (CDetailDoodadInst* inst = CWorldScene::sortTable.m_detailDoodadInstList.Head(); inst; inst = CWorldScene::sortTable.m_detailDoodadInstList.Next(inst)) {
+        const CAaSphere& sphere = inst->m_chunk->m_sphere;
+        float gx = sphere.c.x - s_cameraPos.x;
+        float gy = sphere.c.y - s_cameraPos.y;
+        float gz = sphere.c.z - s_cameraPos.z;
+        float reach = grassRange + sphere.r;
+
+        if (gx * gx + gy * gy + gz * gz > reach * reach) {
+            continue;
+        }
+
         C44Matrix world;
         world.Translate(inst->m_chunk->m_topLeftCoords - CWorldScene::s_activeWorldView);
         CDetailDoodad::s_shaderConstants.m_worldView = world * view;
         // c0..c3 world-view, c4..c7 projection, c8 fog (unused), c9 fade
         g_theGxDevicePtr->ShaderConstantsSet(GxSh_Vertex, 0, reinterpret_cast<const float*>(&CDetailDoodad::s_shaderConstants), 10);
         inst->DrawBatches();
+        s_countSum[4] += Profiling() ? 1.0 : 0.0;
     }
 
     SetBlendOpMin(false);
@@ -904,7 +1288,9 @@ static CGxTex* RenderWaterDepth() {
         }
     }
 
+    TrovichFog::ProfileBegin(TrovichFog::PROF_GRASS);
     RenderGrassDepth();
+    TrovichFog::ProfileEnd(TrovichFog::PROF_GRASS);
 
     GxXformPop(GxXform_World);
     g_theGxDevicePtr->RsPop();
@@ -923,7 +1309,9 @@ void TrovichFog::PrepareWater() {
         return;
     }
 
+    TrovichFog::ProfileBegin(TrovichFog::PROF_WATER);
     s_waterThisFrame = RenderWaterDepth();
+    TrovichFog::ProfileEnd(TrovichFog::PROF_WATER);
 }
 
 void TrovichFog::Composite() {
@@ -972,18 +1360,28 @@ void TrovichFog::Composite() {
     g_theGxDevicePtr->RsSet(GxRs_PixelShader, mode == 1 ? s_fogPixelShader : s_debugPixelShader);
     g_theGxDevicePtr->RsSet(GxRs_Texture0, depth);
     g_theGxDevicePtr->RsSet(GxRs_Texture4, water);
+    g_theGxDevicePtr->RsSet(GxRs_Texture5, NoiseTexture());
 
     if (mode == 1) {
         SetFogConstants();
     }
 
+    TrovichFog::ProfileBegin(TrovichFog::PROF_FOG);
     DrawScreenQuad();
+    TrovichFog::ProfileEnd(TrovichFog::PROF_FOG);
 
-    // stage 4: lamp halos, added on top (the fog constants c0..c7 are still set: the halos read the density)
+    // stage 4: lamp halos, added on top (the fog constants c0..c7 are still set: the halos read the density).
+    // Fast: only over the screen rectangle the halos can reach (often a corner, or nothing at all).
     if (mode == 1 && s_lampsPixelShader && s_lampsPixelShader->Valid() && SetLampConstants()) {
-        GxRsSet(GxRs_BlendingMode, GxBlend_Add);
-        g_theGxDevicePtr->RsSet(GxRs_PixelShader, s_lampsPixelShader);
-        DrawScreenQuad();
+        CRect rect = { -1.0f, -1.0f, 1.0f, 1.0f };
+
+        if (!FastPaths() || LampScreenRect(rect)) {
+            TrovichFog::ProfileBegin(TrovichFog::PROF_LAMPS);
+            GxRsSet(GxRs_BlendingMode, GxBlend_Add);
+            g_theGxDevicePtr->RsSet(GxRs_PixelShader, s_lampsPixelShader);
+            DrawScreenQuad(&rect);
+            TrovichFog::ProfileEnd(TrovichFog::PROF_LAMPS);
+        }
     }
     g_theGxDevicePtr->RsPop();
 }

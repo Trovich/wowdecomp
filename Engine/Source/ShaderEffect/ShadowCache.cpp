@@ -72,6 +72,9 @@ float CShadowCache::s_extDynShadowCullRect[4];
 
 // STATIC: 0x00D43180
 C3Vector CShadowCache::s_sunDir;
+// TROVICH
+int32_t CShadowCache::s_staggerBands;
+C3Vector CShadowCache::s_bandSunDir[3];
 
 // STATIC: 0x00D4318C
 C4Vector CShadowCache::s_sunDirViewSpace;
@@ -560,6 +563,33 @@ void CShadowCache::GatherBands(CShadowCacheQueryData& data, const C3Vector& pos,
             data.m_textureIndex[i] = 0;
             data.m_active[i] = 0;
             data.m_radius[i] = band.m_radius;
+
+            // TROVICH: staggered cascade - band 0 every frame, band 1 every 2nd, band 2 every 4th (never in the
+            // same frame as band 1): 1.75 bands a frame instead of 3. A band also renders when it never did, when
+            // the camera left its centre by 5 % of its radius (a jump) or the sun turned by half a degree. A band
+            // skipped keeps its map, centre (m_lastPos) and sun direction (s_bandSunDir: PostUpdate's matrix).
+            // Its query data is emptied (no flags, an inverted box), so nothing is gathered for it.
+            if (CShadowCache::s_staggerBands && i > 0) {
+                uint32_t phase = frame & 3;
+                int32_t due = i == 1 ? !(phase & 1) : phase == 1;
+                float cell = i == 1 ? 4.0f : 16.0f;
+                C3Vector snapped(floor(pos.x / cell) * cell, floor(pos.y / cell) * cell, floor(pos.z / cell) * cell);
+                float dx = snapped.x - band.m_lastPos.x;
+                float dy = snapped.y - band.m_lastPos.y;
+                float dz = snapped.z - band.m_lastPos.z;
+                float limit = band.m_radius * 0.05f;
+                const C3Vector& last = CShadowCache::s_bandSunDir[i];
+                float turn = last.x * CShadowCache::s_sunDir.x + last.y * CShadowCache::s_sunDir.y + last.z * CShadowCache::s_sunDir.z;
+
+                if (!due && dx * dx + dy * dy + dz * dz <= limit * limit && turn > 0.99996f) {
+                    data.m_queryFlags[i] = 0;
+                    data.m_useCullFrustum[i] = 0;
+                    data.m_extents[i].b = C3Vector(1.0e9f, 1.0e9f, 1.0e9f);
+                    data.m_extents[i].t = C3Vector(-1.0e9f, -1.0e9f, -1.0e9f);
+                    continue;
+                }
+            }
+
             band.m_pos = pos;
 
             float cell;
@@ -594,7 +624,13 @@ void CShadowCache::GatherBands(CShadowCacheQueryData& data, const C3Vector& pos,
 
             data.m_useCullFrustum[i] = useCullFrustum;
 
-            if (useCullFrustum) {
+            // TROVICH: staggered, an outer band keeps what the inner one holds - the inner band is re-rendered at
+            // another time and place, and casters left out of the outer one would leave holes at its edge
+            if (CShadowCache::s_staggerBands && i > 0) {
+                data.m_useCullFrustum[i] = 0;
+            }
+
+            if (data.m_useCullFrustum[i]) {
                 data.m_cullFrustums[i] = frustum;
             }
 
@@ -603,6 +639,7 @@ void CShadowCache::GatherBands(CShadowCacheQueryData& data, const C3Vector& pos,
             frustum.InvertPlanes();
 
             band.m_lastPos = band.m_pos;
+            CShadowCache::s_bandSunDir[i] = CShadowCache::s_sunDir;   // TROVICH
             data.m_active[i] = 1;
             data.m_lastBand = i;
             useCullFrustum = 1;

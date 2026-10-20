@@ -11,3 +11,6 @@ CVar* g_shadowInstancing;
 
 // TROVICH: terrain chunks cast dynamic shadows (ShadowQuery.cpp)
 CVar* g_shadowTerrain;
+
+// TROVICH: VERY_HIGH shadows: the outer bands rendered every 2nd / 4th frame (CShadowCache::s_staggerBands)
+CVar* g_shadowStagger;
